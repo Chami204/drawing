@@ -198,7 +198,7 @@ def main():
     st.markdown("Upload a profile image to find similar matches from our database.")
     
     # Configuration
-    GITHUB_REPO_URL = "https://github.com/yourusername/your-repo-name"  # Replace with your GitHub repo URL
+    GITHUB_REPO_URL = "https://github.com/Chami204/drawing"  # Replace with your GitHub repo URL
     TEMPLATE_PATH = "trained_data"
     
     # Sidebar for configuration
@@ -285,4 +285,5 @@ def main():
         """)
 
 if __name__ == "__main__":
+
     main()
