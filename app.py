@@ -13,10 +13,13 @@ class ProfileMatcher:
         self.templates = {}
         self.reference_size = 300
         self.pixels_to_mm_ratio = None
-        self.load_templates()
+        # Don't load templates in __init__ anymore
 
     def load_templates(self):
-        """Pre-load all template images"""
+        """Pre-load all template images - only when needed"""
+        if self.templates:  # Already loaded
+            return
+            
         st.write("📂 Loading templates...")
         start_time = time.time()
 
@@ -149,6 +152,9 @@ class ProfileMatcher:
 
     def find_similar_profiles(self, user_image, max_matches=5):
         """Find matching profiles with scale normalization"""
+        # Ensure templates are loaded before matching
+        self.load_templates()
+        
         start_time = time.time()
         processed_user, user_measurements = self.preprocess_user_image(user_image)
 
@@ -302,19 +308,15 @@ def main():
         help="Set scale for real measurements (e.g., 0.5 = 2 pixels = 1 mm)"
     )
     
-    # Demo mode - using sample data
+    # Initialize matcher only once using session state
     if 'matcher' not in st.session_state:
-        st.info("🔧 Running in demo mode. To use your own templates, create a 'trained_data' folder with profile images.")
-        
-        # Create a simple demo with sample images
         TEMPLATE_PATH = "trained_data"
-        if not os.path.exists(TEMPLATE_PATH):
-            os.makedirs(TEMPLATE_PATH, exist_ok=True)
-            st.warning(f"📁 Created '{TEMPLATE_PATH}' folder. Please add your template images there.")
-        
         st.session_state.matcher = ProfileMatcher(TEMPLATE_PATH)
-        if pixels_to_mm > 0:
-            st.session_state.matcher.pixels_to_mm_ratio = pixels_to_mm
+        st.info("🔧 Profile matcher initialized. Ready to load templates when needed.")
+    
+    # Apply pixels-to-mm ratio if changed
+    if pixels_to_mm > 0:
+        st.session_state.matcher.pixels_to_mm_ratio = pixels_to_mm
     
     # File upload
     st.header("📤 Upload Profile Image")
@@ -351,6 +353,16 @@ def main():
                     except Exception as e:
                         st.error(f"Error processing image: {str(e)}")
                         st.info("Please try with a different image or check the image format.")
+    
+    # Show template status
+    with st.sidebar:
+        st.header("📊 System Status")
+        if st.session_state.matcher.templates:
+            template_count = sum(len(v) for v in st.session_state.matcher.templates.values())
+            class_count = len(st.session_state.matcher.templates)
+            st.success(f"✅ Templates loaded: {template_count} images, {class_count} classes")
+        else:
+            st.info("📁 Templates not loaded yet - will load when you analyze an image")
 
     # Instructions
     with st.expander("ℹ️ Instructions"):
