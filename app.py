@@ -188,8 +188,6 @@ class OptimizedProfileMatcher:
             return user_standardized, exact_matches[:max_matches], user_measurements
         
         matches = []
-        user_edges = cv2.Canny(user_standardized, 50, 150)
-        user_edge_count = np.sum(user_edges > 0)
         
         for class_name, template_list in self.templates.items():
             for template in template_list:
@@ -244,7 +242,7 @@ def display_measurements(measurements, title="📏 Match Measurements"):
             st.write(f"• Area: {mm['area']:.1f} mm²")
             st.write(f"• Perimeter: {mm['perimeter']:.1f} mm")
 
-def display_results_with_selection(user_img, processed_user, matches, user_measurements, matcher):
+def display_results_with_selection(user_img, processed_user, matches, user_measurements):
     """Display results with interactive selection"""
     
     st.subheader("📊 Profile Matching Results")
@@ -295,10 +293,12 @@ def display_results_with_selection(user_img, processed_user, matches, user_measu
                 col.markdown("</div>", unsafe_allow_html=True)
                 selected_match = match
             
-            # Add click functionality
+            # Add click functionality WITHOUT rerun()
             if col.button(f"Select Match {idx+1}", key=f"select_{idx}"):
+                # Update session state without rerunning everything
                 st.session_state.selected_match_idx = idx
-                st.rerun()  # Refresh to show updated selection
+                # Force a rerun only for selection update
+                st.experimental_rerun()
             
             # Show match info
             similarity_value = match['similarity']
@@ -397,7 +397,7 @@ def main():
     st.sidebar.header("⚙️ Configuration")
     max_matches = st.sidebar.slider("Matches to show", 1, 10, 5)
     
-    # Initialize matcher
+    # Initialize matcher in session state
     if 'matcher' not in st.session_state:
         TEMPLATE_PATH = "trained_data"
         if os.path.exists(TEMPLATE_PATH):
@@ -407,50 +407,92 @@ def main():
             st.error(f"Folder '{TEMPLATE_PATH}' not found!")
             return
     
-    # Reset selection when new analysis starts
-    if 'reset_selection' not in st.session_state:
-        st.session_state.reset_selection = True
+    # Store analysis results in session state
+    if 'analysis_results' not in st.session_state:
+        st.session_state.analysis_results = None
     
-    # File upload
+    # Store uploaded file in session state
+    if 'uploaded_file' not in st.session_state:
+        st.session_state.uploaded_file = None
+    
+    # File upload - store in session state
     uploaded_file = st.file_uploader(
         "Upload profile image", 
         type=['png', '.jpg', '.jpeg'],
-        help="Upload image for matching"
+        help="Upload image for matching",
+        key="file_uploader"
     )
     
-    if uploaded_file is not None:
+    # Update session state when file is uploaded
+    if uploaded_file is not None and uploaded_file != st.session_state.get('uploaded_file'):
+        st.session_state.uploaded_file = uploaded_file
+        # Clear previous analysis when new file is uploaded
+        st.session_state.analysis_results = None
+        st.session_state.selected_match_idx = 0
+    
+    # If we have a file in session state, display it
+    if st.session_state.uploaded_file is not None:
         col1, col2 = st.columns([1, 2])
         
         with col1:
-            image = Image.open(uploaded_file)
+            image = Image.open(st.session_state.uploaded_file)
             st.image(image, caption="Uploaded", use_column_width=True)
         
         with col2:
-            if st.button("🔍 Find Matches", type="primary"):
-                with st.spinner("Finding matches..."):
-                    try:
-                        # Reset selection for new analysis
-                        st.session_state.selected_match_idx = 0
-                        
-                        start_time = time.time()
-                        user_img_cv = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
-                        processed_user, matches, user_measurements = st.session_state.matcher.find_similar_profiles(
-                            user_img_cv, 
-                            max_matches=max_matches
-                        )
-                        
-                        total_time = time.time() - start_time
-                        
-                        processed_user_pil = Image.fromarray(processed_user)
-                        user_img_pil = Image.fromarray(cv2.cvtColor(user_img_cv, cv2.COLOR_BGR2RGB))
-                        
-                        display_results_with_selection(user_img_pil, processed_user_pil, matches, user_measurements, st.session_state.matcher)
-                        
-                        st.sidebar.success(f"Total time: {total_time:.2f} seconds")
-                        
-                    except Exception as e:
-                        st.error(f"Error: {str(e)}")
-
+            # Only show "Find Matches" button if we haven't analyzed yet
+            if st.session_state.analysis_results is None:
+                if st.button("🔍 Find Matches", type="primary"):
+                    with st.spinner("Finding matches..."):
+                        try:
+                            # Reset selection for new analysis
+                            st.session_state.selected_match_idx = 0
+                            
+                            start_time = time.time()
+                            user_img_cv = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
+                            processed_user, matches, user_measurements = st.session_state.matcher.find_similar_profiles(
+                                user_img_cv, 
+                                max_matches=max_matches
+                            )
+                            
+                            total_time = time.time() - start_time
+                            
+                            processed_user_pil = Image.fromarray(processed_user)
+                            user_img_pil = Image.fromarray(cv2.cvtColor(user_img_cv, cv2.COLOR_BGR2RGB))
+                            
+                            # Store results in session state
+                            st.session_state.analysis_results = {
+                                'user_img_pil': user_img_pil,
+                                'processed_user_pil': processed_user_pil,
+                                'matches': matches,
+                                'user_measurements': user_measurements,
+                                'analysis_time': total_time
+                            }
+                            
+                            st.rerun()  # Refresh to show results
+                            
+                        except Exception as e:
+                            st.error(f"Error: {str(e)}")
+            else:
+                # Show "Re-analyze" button instead
+                if st.button("🔄 Re-analyze", type="secondary"):
+                    st.session_state.analysis_results = None
+                    st.rerun()
+    
+    # Display results if we have them in session state
+    if st.session_state.analysis_results is not None:
+        results = st.session_state.analysis_results
+        
+        # Show analysis time
+        st.sidebar.success(f"Analysis time: {results['analysis_time']:.2f} seconds")
+        
+        # Display the results with selection
+        display_results_with_selection(
+            results['user_img_pil'], 
+            results['processed_user_pil'], 
+            results['matches'], 
+            results['user_measurements']
+        )
+    
     # Status
     with st.sidebar:
         if hasattr(st.session_state, 'matcher'):
