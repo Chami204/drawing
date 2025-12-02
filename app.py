@@ -270,6 +270,10 @@ def display_results_with_selection(user_img, processed_user, matches, user_measu
     if 'selected_match_idx' not in st.session_state:
         st.session_state.selected_match_idx = 0  # Default to first match
     
+    # Use callback functions for button clicks
+    def set_selected_idx(idx):
+        st.session_state.selected_match_idx = idx
+    
     # Display matches in columns with clickable selection
     cols = st.columns(len(matches))
     selected_match = None
@@ -285,20 +289,21 @@ def display_results_with_selection(user_img, processed_user, matches, user_measu
             # Display image with border if selected
             if is_selected:
                 col.markdown(f"<div style='border: 3px solid #4CAF50; padding: 5px; border-radius: 5px;'>", unsafe_allow_html=True)
+                selected_match = match
             
             # Display the image
             col.image(match_img, use_column_width=True)
             
             if is_selected:
                 col.markdown("</div>", unsafe_allow_html=True)
-                selected_match = match
             
-            # Add click functionality WITHOUT rerun()
-            if col.button(f"Select Match {idx+1}", key=f"select_{idx}"):
-                # Update session state without rerunning everything
-                st.session_state.selected_match_idx = idx
-                # Force a rerun only for selection update
-                st.experimental_rerun()
+            # Add click functionality
+            col.button(
+                f"Select Match {idx+1}", 
+                key=f"select_{idx}",
+                on_click=set_selected_idx,
+                args=(idx,)
+            )
             
             # Show match info
             similarity_value = match['similarity']
@@ -365,6 +370,7 @@ def display_results_with_selection(user_img, processed_user, matches, user_measu
         # 4. Show all matches summary table
         st.subheader("📋 All Matches Summary")
         
+        import pandas as pd
         summary_data = []
         for i, match in enumerate(matches, 1):
             is_selected = i-1 == st.session_state.selected_match_idx
@@ -379,7 +385,6 @@ def display_results_with_selection(user_img, processed_user, matches, user_measu
                 "Selected": "✅" if is_selected else ""
             })
         
-        import pandas as pd
         df = pd.DataFrame(summary_data)
         st.table(df)
 
@@ -407,15 +412,19 @@ def main():
             st.error(f"Folder '{TEMPLATE_PATH}' not found!")
             return
     
-    # Store analysis results in session state
-    if 'analysis_results' not in st.session_state:
-        st.session_state.analysis_results = None
+    # Initialize session state variables
+    if 'processed_user' not in st.session_state:
+        st.session_state.processed_user = None
+    if 'matches' not in st.session_state:
+        st.session_state.matches = None
+    if 'user_measurements' not in st.session_state:
+        st.session_state.user_measurements = None
+    if 'user_img_pil' not in st.session_state:
+        st.session_state.user_img_pil = None
+    if 'analysis_done' not in st.session_state:
+        st.session_state.analysis_done = False
     
-    # Store uploaded file in session state
-    if 'uploaded_file' not in st.session_state:
-        st.session_state.uploaded_file = None
-    
-    # File upload - store in session state
+    # File upload
     uploaded_file = st.file_uploader(
         "Upload profile image", 
         type=['png', '.jpg', '.jpeg'],
@@ -423,32 +432,37 @@ def main():
         key="file_uploader"
     )
     
-    # Update session state when file is uploaded
-    if uploaded_file is not None and uploaded_file != st.session_state.get('uploaded_file'):
-        st.session_state.uploaded_file = uploaded_file
-        # Clear previous analysis when new file is uploaded
-        st.session_state.analysis_results = None
-        st.session_state.selected_match_idx = 0
-    
-    # If we have a file in session state, display it
-    if st.session_state.uploaded_file is not None:
+    if uploaded_file is not None:
         col1, col2 = st.columns([1, 2])
         
         with col1:
-            image = Image.open(st.session_state.uploaded_file)
+            image = Image.open(uploaded_file)
             st.image(image, caption="Uploaded", use_column_width=True)
         
         with col2:
-            # Only show "Find Matches" button if we haven't analyzed yet
-            if st.session_state.analysis_results is None:
+            # Check if we need to analyze or re-analyze
+            analyze_needed = True
+            if st.session_state.analysis_done:
+                # Check if this is the same file (by comparing first few bytes)
+                current_file_bytes = uploaded_file.getvalue()[:100]
+                if 'last_file_bytes' in st.session_state:
+                    if current_file_bytes == st.session_state.last_file_bytes:
+                        analyze_needed = False
+            
+            if analyze_needed:
                 if st.button("🔍 Find Matches", type="primary"):
                     with st.spinner("Finding matches..."):
                         try:
-                            # Reset selection for new analysis
+                            # Store file bytes for comparison
+                            st.session_state.last_file_bytes = uploaded_file.getvalue()[:100]
+                            
+                            # Reset selection
                             st.session_state.selected_match_idx = 0
                             
                             start_time = time.time()
                             user_img_cv = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
+                            
+                            # Perform analysis
                             processed_user, matches, user_measurements = st.session_state.matcher.find_similar_profiles(
                                 user_img_cv, 
                                 max_matches=max_matches
@@ -456,41 +470,40 @@ def main():
                             
                             total_time = time.time() - start_time
                             
+                            # Convert images for display
                             processed_user_pil = Image.fromarray(processed_user)
                             user_img_pil = Image.fromarray(cv2.cvtColor(user_img_cv, cv2.COLOR_BGR2RGB))
                             
-                            # Store results in session state
-                            st.session_state.analysis_results = {
-                                'user_img_pil': user_img_pil,
-                                'processed_user_pil': processed_user_pil,
-                                'matches': matches,
-                                'user_measurements': user_measurements,
-                                'analysis_time': total_time
-                            }
+                            # Store everything in session state
+                            st.session_state.processed_user = processed_user_pil
+                            st.session_state.matches = matches
+                            st.session_state.user_measurements = user_measurements
+                            st.session_state.user_img_pil = user_img_pil
+                            st.session_state.analysis_done = True
+                            st.session_state.analysis_time = total_time
                             
-                            st.rerun()  # Refresh to show results
+                            st.rerun()
                             
                         except Exception as e:
                             st.error(f"Error: {str(e)}")
             else:
-                # Show "Re-analyze" button instead
+                # Show re-analyze option
                 if st.button("🔄 Re-analyze", type="secondary"):
-                    st.session_state.analysis_results = None
+                    st.session_state.analysis_done = False
                     st.rerun()
     
-    # Display results if we have them in session state
-    if st.session_state.analysis_results is not None:
-        results = st.session_state.analysis_results
-        
-        # Show analysis time
-        st.sidebar.success(f"Analysis time: {results['analysis_time']:.2f} seconds")
+    # Display results if analysis is done
+    if st.session_state.analysis_done and st.session_state.matches is not None:
+        # Show analysis time in sidebar
+        if 'analysis_time' in st.session_state:
+            st.sidebar.success(f"Analysis time: {st.session_state.analysis_time:.2f} seconds")
         
         # Display the results with selection
         display_results_with_selection(
-            results['user_img_pil'], 
-            results['processed_user_pil'], 
-            results['matches'], 
-            results['user_measurements']
+            st.session_state.user_img_pil, 
+            st.session_state.processed_user, 
+            st.session_state.matches, 
+            st.session_state.user_measurements
         )
     
     # Status
