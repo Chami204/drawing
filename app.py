@@ -12,7 +12,6 @@ class OptimizedProfileMatcher:
         self.template_root = template_root
         self.templates = {}
         self.reference_size = 300
-        self.pixels_to_mm_ratio = None
         self.template_hashes = {}
 
     def load_templates(self):
@@ -31,17 +30,14 @@ class OptimizedProfileMatcher:
                         img_path = os.path.join(class_path, img_file)
                         img = cv2.imread(img_path, cv2.IMREAD_GRAYSCALE)
                         if img is not None:
-                            standardized = self.fast_normalize(img)
+                            standardized = self.fast_normalize(img, preserve_aspect=True)
                             img_hash = self.compute_image_hash(standardized)
-                            
-                            measurements = self.fast_measurements(standardized)
                             
                             class_images.append({
                                 'original': img,
                                 'standardized': standardized,
                                 'filename': os.path.basename(img_path),
                                 'class': class_name,
-                                'measurements': measurements,
                                 'hash': img_hash
                             })
                             
@@ -65,7 +61,8 @@ class OptimizedProfileMatcher:
                     hash_value |= 1 << (i * 8 + j)
         return hash_value
 
-    def fast_normalize(self, image):
+    def fast_normalize(self, image, preserve_aspect=True):
+        """Normalize image while preserving original proportions"""
         if len(image.shape) == 3:
             gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
         else:
@@ -75,60 +72,41 @@ class OptimizedProfileMatcher:
         contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         
         if not contours:
-            return cv2.resize(gray, (self.reference_size, self.reference_size))
-        
-        contour = max(contours, key=cv2.contourArea)
-        x, y, w, h = cv2.boundingRect(contour)
-        cropped = gray[y:y+h, x:x+w]
-        resized = cv2.resize(cropped, (self.reference_size, self.reference_size), interpolation=cv2.INTER_AREA)
-        
-        return resized
-
-    def fast_measurements(self, standardized_img):
-        _, thresh = cv2.threshold(standardized_img, 200, 255, cv2.THRESH_BINARY_INV)
-        contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        
-        if not contours:
-            return {
-                'pixels': {
-                    'height': 0, 'width': 0, 'area': 0,
-                    'perimeter': 0, 'aspect_ratio': 0
-                },
-                'millimeters': None
-            }
+            # If no contour found, return original size resized to fit
+            h, w = gray.shape
+            scale = self.reference_size / max(h, w)
+            new_h, new_w = int(h * scale), int(w * scale)
+            return cv2.resize(gray, (new_w, new_h))
         
         contour = max(contours, key=cv2.contourArea)
         x, y, w, h = cv2.boundingRect(contour)
         
-        height_px = h
-        width_px = w
-        area_px = cv2.contourArea(contour)
-        perimeter_px = cv2.arcLength(contour, True)
-        aspect_ratio = w / h if h > 0 else 0
+        # Extract the profile region
+        profile_region = gray[y:y+h, x:x+w]
         
-        if self.pixels_to_mm_ratio:
-            height_mm = height_px * self.pixels_to_mm_ratio
-            width_mm = width_px * self.pixels_to_mm_ratio
-            area_mm2 = area_px * (self.pixels_to_mm_ratio ** 2)
-            perimeter_mm = perimeter_px * self.pixels_to_mm_ratio
+        if preserve_aspect:
+            # Preserve original aspect ratio - fit within reference_size
+            scale = self.reference_size / max(w, h)
+            new_width = int(w * scale)
+            new_height = int(h * scale)
+            
+            # Resize preserving aspect ratio
+            resized = cv2.resize(profile_region, (new_width, new_height), interpolation=cv2.INTER_AREA)
+            
+            # Create a canvas of reference_size x reference_size with white background
+            result = np.ones((self.reference_size, self.reference_size), dtype=np.uint8) * 255
+            
+            # Calculate position to center the resized image
+            x_offset = (self.reference_size - new_width) // 2
+            y_offset = (self.reference_size - new_height) // 2
+            
+            # Place the resized image in the center
+            result[y_offset:y_offset+new_height, x_offset:x_offset+new_width] = resized
+            
+            return result
         else:
-            height_mm = width_mm = area_mm2 = perimeter_mm = None
-        
-        return {
-            'pixels': {
-                'height': height_px,
-                'width': width_px,
-                'area': area_px,
-                'perimeter': perimeter_px,
-                'aspect_ratio': aspect_ratio
-            },
-            'millimeters': {
-                'height': height_mm,
-                'width': width_mm,
-                'area': area_mm2,
-                'perimeter': perimeter_mm
-            } if self.pixels_to_mm_ratio else None
-        }
+            # Original behavior - stretch to square
+            return cv2.resize(profile_region, (self.reference_size, self.reference_size), interpolation=cv2.INTER_AREA)
 
     def fast_similarity(self, img1, img2):
         hash1 = self.compute_image_hash(img1)
@@ -166,7 +144,7 @@ class OptimizedProfileMatcher:
         else:
             user_gray = user_image.copy()
         
-        user_standardized = self.fast_normalize(user_gray)
+        user_standardized = self.fast_normalize(user_gray, preserve_aspect=True)
         user_hash = self.compute_image_hash(user_standardized)
         
         # Check for exact match first
@@ -178,14 +156,12 @@ class OptimizedProfileMatcher:
                 'class': exact_match['class'],
                 'filename': exact_match['filename'],
                 'standardized': exact_match['standardized'],
-                'measurements': self.fast_measurements(exact_match['standardized']),
                 'is_exact_match': True
             })
         
         if exact_matches:
-            user_measurements = self.fast_measurements(user_standardized)
             st.write(f"✅ Found exact match in {time.time()-start_time:.2f} seconds!")
-            return user_standardized, exact_matches[:max_matches], user_measurements
+            return user_standardized, exact_matches[:max_matches]
         
         matches = []
         
@@ -198,8 +174,7 @@ class OptimizedProfileMatcher:
                     'class': class_name,
                     'image': template['original'],
                     'processed': template['standardized'],
-                    'filename': template['filename'],
-                    'measurements': template['measurements']
+                    'filename': template['filename']
                 })
 
         matches.sort(key=lambda x: x['similarity'], reverse=True)
@@ -212,37 +187,11 @@ class OptimizedProfileMatcher:
                 seen_classes.add(match['class'])
                 if len(results) >= max_matches:
                     break
-
-        user_measurements = self.fast_measurements(user_standardized)
         
         st.write(f"⏱️ Matching completed in {time.time()-start_time:.2f} seconds")
-        return user_standardized, results, user_measurements
+        return user_standardized, results
 
-def display_measurements(measurements, title="📏 Match Measurements"):
-    """Display measurements in a clean format"""
-    st.subheader(title)
-    
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        st.markdown("**📐 Pixel Measurements:**")
-        pixels = measurements['pixels']
-        st.write(f"• Height: {pixels['height']:.1f} px")
-        st.write(f"• Width: {pixels['width']:.1f} px")
-        st.write(f"• Area: {pixels['area']:.1f} px²")
-        st.write(f"• Perimeter: {pixels['perimeter']:.1f} px")
-        st.write(f"• Aspect Ratio: {pixels['aspect_ratio']:.2f}")
-    
-    with col2:
-        if measurements['millimeters']:
-            st.markdown("**📏 Real-world Measurements:**")
-            mm = measurements['millimeters']
-            st.write(f"• Height: {mm['height']:.1f} mm")
-            st.write(f"• Width: {mm['width']:.1f} mm")
-            st.write(f"• Area: {mm['area']:.1f} mm²")
-            st.write(f"• Perimeter: {mm['perimeter']:.1f} mm")
-
-def display_results_with_selection(user_img, processed_user, matches, user_measurements):
+def display_results_with_selection(user_img, processed_user, matches):
     """Display results with interactive selection"""
     
     st.subheader("📊 Profile Matching Results")
@@ -252,15 +201,11 @@ def display_results_with_selection(user_img, processed_user, matches, user_measu
     with col1:
         st.image(user_img, caption="Original Input", use_column_width=True)
     with col2:
-        st.image(processed_user, caption="Normalized", use_column_width=True)
+        st.image(processed_user, caption="Normalized (Preserved Aspect Ratio)", use_column_width=True)
     
     # Show exact match notification
     if matches and matches[0].get('is_exact_match', False):
         st.success(f"🎯 EXACT MATCH FOUND: {matches[0]['class']}")
-    
-    # Display user measurements
-    with st.expander("📏 Your Measurements", expanded=False):
-        display_measurements(user_measurements, "Your Profile")
     
     # 1. FIRST: Show all similar matches for selection
     st.subheader("🎯 Select a Match (Click on an image)")
@@ -318,7 +263,7 @@ def display_results_with_selection(user_img, processed_user, matches, user_measu
             if is_selected:
                 col.success("✅ Selected")
     
-    # 2. THEN: Show the selected match as best match with calculations
+    # 2. THEN: Show the selected match as best match
     if selected_match is None and len(matches) > 0:
         selected_match = matches[st.session_state.selected_match_idx]
     
@@ -328,12 +273,20 @@ def display_results_with_selection(user_img, processed_user, matches, user_measu
         # Show the selected match as "Best Match"
         st.subheader(f"🏆 Best Match: {selected_match['class']}")
         
-        col1, col2, col3 = st.columns([2, 1, 1])
+        col1, col2 = st.columns([2, 1])
         
         with col1:
             # Show the selected match image
             selected_img = Image.fromarray(selected_match['processed'])
-            st.image(selected_img, caption=f"Selected as Best Match", use_column_width=True)
+            
+            # Get original image dimensions if available
+            if 'image' in selected_match and selected_match['image'] is not None:
+                original_img = selected_match['image']
+                if isinstance(original_img, np.ndarray):
+                    h, w = original_img.shape[:2]
+                    st.caption(f"Original size: {w}×{h} pixels")
+            
+            st.image(selected_img, caption=f"Selected as Best Match (Preserved Aspect Ratio)", use_column_width=True)
             
             # Show similarity score
             similarity_value = selected_match['similarity']
@@ -346,26 +299,16 @@ def display_results_with_selection(user_img, processed_user, matches, user_measu
             st.caption(f"Rank: {st.session_state.selected_match_idx + 1} of {len(matches)}")
         
         with col2:
-            # 3. Show the relevant calculations for the selected image
-            display_measurements(selected_match['measurements'], f"Selected Match")
-        
-        with col3:
-            # Quick comparison with user image
-            st.markdown("**📊 Quick Comparison**")
-            user_pixels = user_measurements['pixels']
-            match_pixels = selected_match['measurements']['pixels']
+            # Show match details
+            st.markdown("**📊 Match Details**")
+            st.write(f"**Class:** {selected_match['class']}")
+            st.write(f"**Similarity:** {selected_match['similarity']:.3f}")
+            st.write(f"**Filename:** {selected_match['filename']}")
             
-            height_diff = user_pixels['height'] - match_pixels['height']
-            width_diff = user_pixels['width'] - match_pixels['width']
-            area_diff = user_pixels['area'] - match_pixels['area']
-            
-            st.write(f"Height diff: {height_diff:+.1f} px")
-            st.write(f"Width diff: {width_diff:+.1f} px")
-            st.write(f"Area diff: {area_diff:+.1f} px²")
-            
-            # Aspect ratio similarity
-            aspect_similarity = 1 - abs(user_pixels['aspect_ratio'] - match_pixels['aspect_ratio'])
-            st.write(f"Aspect similarity: {aspect_similarity:.3f}")
+            if selected_match.get('is_exact_match', False):
+                st.success("**Type:** Exact Match")
+            else:
+                st.info("**Type:** Similar Match")
         
         # 4. Show all matches summary table
         st.subheader("📋 All Matches Summary")
@@ -374,14 +317,12 @@ def display_results_with_selection(user_img, processed_user, matches, user_measu
         summary_data = []
         for i, match in enumerate(matches, 1):
             is_selected = i-1 == st.session_state.selected_match_idx
-            measurements = match['measurements']['pixels']
             
             summary_data.append({
                 "Rank": i,
                 "Class": match['class'],
                 "Similarity": f"{match['similarity']:.3f}",
-                "Height (px)": f"{measurements['height']:.1f}",
-                "Area (px²)": f"{measurements['area']:.1f}",
+                "Type": "Exact" if match.get('is_exact_match', False) else "Similar",
                 "Selected": "✅" if is_selected else ""
             })
         
@@ -390,13 +331,13 @@ def display_results_with_selection(user_img, processed_user, matches, user_measu
 
 def main():
     st.set_page_config(
-        page_title="Interactive Profile Matcher",
-        page_icon="🎯",
+        page_title="Profile Matcher",
+        page_icon="🔍",
         layout="wide"
     )
     
-    st.title("🎯 Interactive Profile Matching System")
-    st.markdown("Select any match by clicking on the image")
+    st.title("🔍 Profile Matching System")
+    st.markdown("Upload an image to find similar profiles")
     
     # Sidebar configuration
     st.sidebar.header("⚙️ Configuration")
@@ -407,7 +348,7 @@ def main():
         TEMPLATE_PATH = "trained_data"
         if os.path.exists(TEMPLATE_PATH):
             st.session_state.matcher = OptimizedProfileMatcher(TEMPLATE_PATH)
-            st.info("🎯 Interactive matcher initialized")
+            st.info("🔍 Profile matcher initialized")
         else:
             st.error(f"Folder '{TEMPLATE_PATH}' not found!")
             return
@@ -417,8 +358,6 @@ def main():
         st.session_state.processed_user = None
     if 'matches' not in st.session_state:
         st.session_state.matches = None
-    if 'user_measurements' not in st.session_state:
-        st.session_state.user_measurements = None
     if 'user_img_pil' not in st.session_state:
         st.session_state.user_img_pil = None
     if 'analysis_done' not in st.session_state:
@@ -463,7 +402,7 @@ def main():
                             user_img_cv = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
                             
                             # Perform analysis
-                            processed_user, matches, user_measurements = st.session_state.matcher.find_similar_profiles(
+                            processed_user, matches = st.session_state.matcher.find_similar_profiles(
                                 user_img_cv, 
                                 max_matches=max_matches
                             )
@@ -477,7 +416,6 @@ def main():
                             # Store everything in session state
                             st.session_state.processed_user = processed_user_pil
                             st.session_state.matches = matches
-                            st.session_state.user_measurements = user_measurements
                             st.session_state.user_img_pil = user_img_pil
                             st.session_state.analysis_done = True
                             st.session_state.analysis_time = total_time
@@ -502,8 +440,7 @@ def main():
         display_results_with_selection(
             st.session_state.user_img_pil, 
             st.session_state.processed_user, 
-            st.session_state.matches, 
-            st.session_state.user_measurements
+            st.session_state.matches
         )
     
     # Status
@@ -518,21 +455,21 @@ def main():
         st.markdown("1. Upload an image")
         st.markdown("2. Click 'Find Matches'")
         st.markdown("3. Click on any match image to select it")
-        st.markdown("4. View selected match details below")
+        st.markdown("4. Selected match shown as Best Match")
 
     with st.expander("ℹ️ How to use"):
         st.markdown("""
-        **🎯 Interactive Features:**
+        **🔍 Features:**
         1. **Clickable Images**: Click on any match to select it
-        2. **Dynamic Updates**: Measurements update based on selection
-        3. **Exact Match Detection**: Identical images show as 100% match
-        4. **Comparison View**: Side-by-side with your image
+        2. **Exact Match Detection**: Identical images show as 100% match
+        3. **Preserved Aspect Ratio**: Images shown in original proportions
+        4. **Fast Matching**: Optimized for speed
         
-        **📊 Selection Workflow:**
+        **📊 Workflow:**
         1. All matches shown first for selection
         2. Click any image to select it as "Best Match"
-        3. Selected match details shown immediately
-        4. Compare with your image measurements
+        3. Selected match shown with details
+        4. No measurements - focus on visual similarity
         """)
 
 if __name__ == "__main__":
