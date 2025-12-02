@@ -181,7 +181,7 @@ class OptimizedProfileMatcher:
         except:
             return ssim(img1, img2)
 
-    def find_similar_profiles(self, user_image, max_matches=5):
+    def find_similar_profiles(self, user_image, max_matches=10):
         """Optimized matching with exact match priority"""
         self.load_templates()
         
@@ -432,3 +432,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
