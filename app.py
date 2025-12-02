@@ -181,7 +181,7 @@ class OptimizedProfileMatcher:
         except:
             return ssim(img1, img2)
 
-    def find_similar_profiles(self, user_image, max_matches=10):
+    def find_similar_profiles(self, user_image, max_matches=5):
         """Optimized matching with exact match priority"""
         self.load_templates()
         
@@ -355,7 +355,7 @@ def main():
     
     # Simple configuration
     st.sidebar.header("⚙️ Quick Settings")
-    max_matches = st.sidebar.slider("Matches to show", 1, 5, 3)
+    max_matches = st.sidebar.slider("Matches to show", 1, 10, 3)
     
     # Initialize matcher
     if 'matcher' not in st.session_state:
@@ -432,4 +432,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
