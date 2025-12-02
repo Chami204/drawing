@@ -15,13 +15,11 @@ class EnhancedProfileMatcher:
         self.templates = {}
         self.reference_size = 300
         self.pixels_to_mm_ratio = None
-        self.shape_features_cache = {}
-        self.original_images = {}  # Store original reference images
-        # Don't load templates in __init__ anymore
+        self.original_images = {}
 
     def load_templates(self):
         """Pre-load all template images - only when needed"""
-        if self.templates:  # Already loaded
+        if self.templates:
             return
             
         st.write("📂 Loading templates...")
@@ -32,13 +30,13 @@ class EnhancedProfileMatcher:
             if os.path.isdir(class_path):
                 class_images = []
                 
-                # Look for original image first
-                original_img = None
+                # Look for original image
                 for img_file in os.listdir(class_path):
                     if 'original' in img_file.lower() and img_file.lower().endswith(('.png', '.jpg', '.jpeg')):
                         original_path = os.path.join(class_path, img_file)
                         original_img = cv2.imread(original_path, cv2.IMREAD_GRAYSCALE)
-                        self.original_images[class_name] = original_img
+                        if original_img is not None:
+                            self.original_images[class_name] = original_img
                         break
                 
                 for img_file in os.listdir(class_path):
@@ -46,38 +44,46 @@ class EnhancedProfileMatcher:
                         img_path = os.path.join(class_path, img_file)
                         img = cv2.imread(img_path, cv2.IMREAD_GRAYSCALE)
                         if img is not None:
-                            standardized, measurements, shape_features = self.scale_normalize_with_analysis(img)
-                            class_images.append({
-                                'original': img,
-                                'standardized': standardized,
-                                'filename': os.path.basename(img_path),
-                                'class': class_name,
-                                'measurements': measurements,
-                                'shape_features': shape_features,
-                                'is_original': 'original' in img_file.lower()
-                            })
+                            try:
+                                standardized, measurements, shape_features = self.scale_normalize_with_analysis(img)
+                                class_images.append({
+                                    'original': img,
+                                    'standardized': standardized,
+                                    'filename': os.path.basename(img_path),
+                                    'class': class_name,
+                                    'measurements': measurements,
+                                    'shape_features': shape_features or {},
+                                    'is_original': 'original' in img_file.lower()
+                                })
+                            except Exception as e:
+                                st.warning(f"Could not process {img_file}: {str(e)}")
+                                continue
+                
                 if class_images:
                     self.templates[class_name] = class_images
 
         st.success(f"✅ Loaded {sum(len(v) for v in self.templates.values())} templates from {len(self.templates)} classes in {time.time()-start_time:.2f} seconds")
 
     def detect_profile_contour(self, image):
-        """Enhanced contour detection with better thresholding"""
-        # Use adaptive thresholding for better edge detection
+        """Enhanced contour detection"""
         if len(image.shape) == 3:
             gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
         else:
             gray = image.copy()
         
-        # Apply Gaussian blur to reduce noise
+        # Apply Gaussian blur
         blurred = cv2.GaussianBlur(gray, (5, 5), 0)
         
-        # Use adaptive thresholding
-        thresh = cv2.adaptiveThreshold(blurred, 255, 
-                                      cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                                      cv2.THRESH_BINARY_INV, 11, 2)
+        # Try adaptive thresholding
+        try:
+            thresh = cv2.adaptiveThreshold(blurred, 255, 
+                                          cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                          cv2.THRESH_BINARY_INV, 11, 2)
+        except:
+            # Fallback to simple thresholding
+            _, thresh = cv2.threshold(blurred, 200, 255, cv2.THRESH_BINARY_INV)
         
-        # Morphological operations to clean up
+        # Morphological operations
         kernel = np.ones((3,3), np.uint8)
         thresh = cv2.morphologyEx(thresh, cv2.MORPH_CLOSE, kernel)
         thresh = cv2.morphologyEx(thresh, cv2.MORPH_OPEN, kernel)
@@ -85,180 +91,187 @@ class EnhancedProfileMatcher:
         contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
         
         if not contours:
-            # Fallback to simple thresholding
-            _, thresh_simple = cv2.threshold(gray, 200, 255, cv2.THRESH_BINARY_INV)
-            contours, _ = cv2.findContours(thresh_simple, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        
-        if not contours:
             return None
             
-        # Get the largest contour
         main_contour = max(contours, key=cv2.contourArea)
         
-        # Approximate contour to reduce noise
+        # Simplify contour
         epsilon = 0.001 * cv2.arcLength(main_contour, True)
         approximated = cv2.approxPolyDP(main_contour, epsilon, True)
         
         return approximated
 
     def analyze_shape_features(self, contour):
-        """Enhanced shape analysis for better differentiation"""
-        if contour is None or len(contour) < 5:
+        """Enhanced shape analysis with error handling"""
+        if contour is None or len(contour) < 3:
+            return self.get_default_shape_features()
+        
+        try:
+            area = cv2.contourArea(contour)
+            perimeter = cv2.arcLength(contour, True)
+            
+            # Circularity
+            circularity = (4 * math.pi * area) / (perimeter ** 2) if perimeter > 0 else 0
+            
+            # Bounding rectangle
+            rect = cv2.minAreaRect(contour)
+            box = cv2.boxPoints(rect)
+            box_area = cv2.contourArea(box)
+            rectangularity = area / box_area if box_area > 0 else 0
+            
+            # Corner detection
+            epsilon = 0.02 * perimeter if perimeter > 0 else 0.1
+            approx = cv2.approxPolyDP(contour, epsilon, True)
+            corner_count = len(approx)
+            
+            # Curvature analysis
+            curvature_index = self.calculate_curvature_index(contour)
+            
+            # Straight edge detection
+            straight_edge_ratio = self.detect_straight_edges(contour)
+            
+            # Angularity
+            angularity = corner_count / max(len(contour) / 10, 1)
+            
+            # Symmetry
+            symmetry_score = self.calculate_symmetry(contour)
+            
+            # Compactness
+            compactness = (perimeter ** 2) / (4 * math.pi * area) if area > 0 else 0
+            
+            # Shape classification
+            shape_type = self.classify_shape(circularity, rectangularity, angularity, curvature_index)
+            
             return {
-                'circularity': 0,
-                'rectangularity': 0,
-                'angularity': 0,
-                'curvature_index': 0,
-                'straight_edge_ratio': 0,
-                'corner_count': 0,
-                'symmetry_score': 0,
-                'compactness': 0
+                'circularity': min(circularity, 1.0),
+                'rectangularity': min(rectangularity, 1.0),
+                'angularity': min(angularity, 1.0),
+                'curvature_index': min(curvature_index, 1.0),
+                'straight_edge_ratio': min(straight_edge_ratio, 1.0),
+                'corner_count': corner_count,
+                'symmetry_score': min(symmetry_score, 1.0),
+                'compactness': compactness,
+                'shape_type': shape_type
             }
-        
-        # Basic measurements
-        area = cv2.contourArea(contour)
-        perimeter = cv2.arcLength(contour, True)
-        
-        # Circularity
-        circularity = (4 * math.pi * area) / (perimeter ** 2) if perimeter > 0 else 0
-        
-        # Bounding rectangle analysis
-        rect = cv2.minAreaRect(contour)
-        box = cv2.boxPoints(rect)
-        box_area = cv2.contourArea(box)
-        rectangularity = area / box_area if box_area > 0 else 0
-        
-        # Corner detection using Harris or approximation
-        corner_count = self.detect_corners(contour)
-        
-        # Curvature analysis
-        curvature_index = self.calculate_curvature_index(contour)
-        
-        # Straight edge detection
-        straight_edge_ratio = self.detect_straight_edges(contour)
-        
-        # Angularity (how angular vs curved)
-        angularity = corner_count / (len(contour) / 10) if len(contour) > 0 else 0
-        
-        # Symmetry analysis
-        symmetry_score = self.calculate_symmetry(contour)
-        
-        # Compactness
-        compactness = (perimeter ** 2) / (4 * math.pi * area) if area > 0 else 0
-        
+        except Exception as e:
+            st.warning(f"Shape analysis error: {str(e)}")
+            return self.get_default_shape_features()
+    
+    def get_default_shape_features(self):
+        """Return default shape features when analysis fails"""
         return {
-            'circularity': circularity,  # 1.0 = perfect circle
-            'rectangularity': rectangularity,  # 1.0 = perfect rectangle
-            'angularity': min(angularity, 1.0),  # Higher = more angular
-            'curvature_index': curvature_index,  # Higher = more curved
-            'straight_edge_ratio': straight_edge_ratio,  # Ratio of straight edges
-            'corner_count': corner_count,
-            'symmetry_score': symmetry_score,
-            'compactness': compactness,
-            'shape_type': self.classify_shape(circularity, rectangularity, angularity, curvature_index)
+            'circularity': 0,
+            'rectangularity': 0,
+            'angularity': 0,
+            'curvature_index': 0,
+            'straight_edge_ratio': 0,
+            'corner_count': 0,
+            'symmetry_score': 0,
+            'compactness': 0,
+            'shape_type': 'Unknown'
         }
     
-    def detect_corners(self, contour):
-        """Detect corners using Douglas-Peucker algorithm"""
-        if len(contour) < 5:
-            return 0
-            
-        # Simplify contour
-        epsilon = 0.02 * cv2.arcLength(contour, True)
-        approx = cv2.approxPolyDP(contour, epsilon, True)
-        
-        # Count vertices
-        return len(approx)
-    
     def calculate_curvature_index(self, contour):
-        """Calculate how curved the shape is"""
+        """Calculate curvature index"""
         if len(contour) < 10:
             return 0
-            
-        contour = contour.reshape(-1, 2)
-        curvatures = []
         
-        for i in range(1, len(contour)-1):
-            p1 = contour[i-1]
-            p2 = contour[i]
-            p3 = contour[i+1]
+        try:
+            contour = contour.reshape(-1, 2)
+            curvatures = []
             
-            # Calculate curvature using cross product method
-            v1 = p2 - p1
-            v2 = p3 - p2
-            
-            if np.linalg.norm(v1) > 0 and np.linalg.norm(v2) > 0:
-                # Normalize vectors
-                v1_norm = v1 / np.linalg.norm(v1)
-                v2_norm = v2 / np.linalg.norm(v2)
+            for i in range(1, len(contour)-1):
+                p1 = contour[i-1]
+                p2 = contour[i]
+                p3 = contour[i+1]
                 
-                # Calculate angle between vectors
-                dot_product = np.dot(v1_norm, v2_norm)
-                angle = np.arccos(np.clip(dot_product, -1.0, 1.0))
-                curvatures.append(angle)
+                v1 = p2 - p1
+                v2 = p3 - p2
+                
+                if np.linalg.norm(v1) > 0 and np.linalg.norm(v2) > 0:
+                    v1_norm = v1 / np.linalg.norm(v1)
+                    v2_norm = v2 / np.linalg.norm(v2)
+                    
+                    dot_product = np.dot(v1_norm, v2_norm)
+                    dot_product = np.clip(dot_product, -1.0, 1.0)
+                    angle = np.arccos(dot_product)
+                    curvatures.append(angle)
+            
+            if curvatures:
+                avg_curvature = np.mean(curvatures)
+                return min(avg_curvature / (math.pi/2), 1.0)
+        except:
+            pass
         
-        if curvatures:
-            avg_curvature = np.mean(curvatures)
-            # Normalize to 0-1 range
-            return min(avg_curvature / (math.pi/2), 1.0)
         return 0
     
     def detect_straight_edges(self, contour):
-        """Detect ratio of straight edges in contour"""
+        """Detect straight edges"""
         if len(contour) < 10:
             return 0
-            
-        contour = contour.reshape(-1, 2)
-        straight_segments = 0
-        total_segments = len(contour) - 1
         
-        for i in range(len(contour)-2):
-            p1 = contour[i]
-            p2 = contour[i+1]
-            p3 = contour[i+2]
+        try:
+            contour = contour.reshape(-1, 2)
+            straight_segments = 0
+            total_segments = max(len(contour) - 2, 1)
             
-            # Check if points are approximately collinear
-            area = abs((p1[0]*(p2[1]-p3[1]) + p2[0]*(p3[1]-p1[1]) + p3[0]*(p1[1]-p2[1])) / 2)
-            if area < 2:  # Threshold for collinearity
-                straight_segments += 1
-        
-        return straight_segments / total_segments if total_segments > 0 else 0
+            for i in range(len(contour)-2):
+                p1 = contour[i]
+                p2 = contour[i+1]
+                p3 = contour[i+2]
+                
+                # Check collinearity
+                area = abs((p1[0]*(p2[1]-p3[1]) + p2[0]*(p3[1]-p1[1]) + p3[0]*(p1[1]-p2[1])) / 2)
+                if area < 2:
+                    straight_segments += 1
+            
+            return straight_segments / total_segments
+        except:
+            return 0
     
     def calculate_symmetry(self, contour):
-        """Calculate symmetry score of the shape"""
+        """Calculate symmetry score"""
         if len(contour) < 10:
             return 0
+        
+        try:
+            contour = contour.reshape(-1, 2)
             
-        contour = contour.reshape(-1, 2)
-        
-        # Find centroid
-        M = cv2.moments(contour)
-        if M['m00'] == 0:
-            return 0
+            # Find centroid
+            M = cv2.moments(contour)
+            if M['m00'] == 0:
+                return 0
             
-        cx = int(M['m10'] / M['m00'])
-        cy = int(M['m01'] / M['m00'])
+            cx = int(M['m10'] / M['m00'])
+            cy = int(M['m01'] / M['m00'])
+            
+            # Calculate distances
+            centroid = np.array([cx, cy])
+            distances = [np.linalg.norm(p - centroid) for p in contour]
+            
+            # Check symmetry
+            symmetry_errors = []
+            n = len(contour)
+            for i in range(n):
+                opposite_idx = (i + n//2) % n
+                if distances[i] > 0 or distances[opposite_idx] > 0:
+                    error = abs(distances[i] - distances[opposite_idx]) / max(distances[i], distances[opposite_idx])
+                    symmetry_errors.append(error)
+            
+            if symmetry_errors:
+                avg_error = np.mean(symmetry_errors)
+                return 1 - min(avg_error, 1.0)
+        except:
+            pass
         
-        # Calculate distances from centroid
-        distances = [np.linalg.norm(np.array([cx, cy]) - np.array(p)) for p in contour]
-        
-        # Check symmetry by comparing opposite points
-        symmetry_errors = []
-        for i in range(len(contour)):
-            opposite_idx = (i + len(contour)//2) % len(contour)
-            dist1 = distances[i]
-            dist2 = distances[opposite_idx]
-            symmetry_errors.append(abs(dist1 - dist2) / max(dist1, dist2) if max(dist1, dist2) > 0 else 0)
-        
-        avg_error = np.mean(symmetry_errors) if symmetry_errors else 0
-        return 1 - min(avg_error, 1.0)
+        return 0
     
     def classify_shape(self, circularity, rectangularity, angularity, curvature_index):
-        """Classify shape based on features"""
+        """Classify shape type"""
         if circularity > 0.9:
             return "Circle/Ellipse"
         elif rectangularity > 0.85:
-            return "Rectangle"
+            return "Rectangle/Square"
         elif angularity > 0.7:
             return "Angular/Polygonal"
         elif curvature_index > 0.6:
@@ -267,95 +280,106 @@ class EnhancedProfileMatcher:
             return "Complex/Mixed"
 
     def calculate_measurements(self, contour, scale_factor=1.0):
-        """Enhanced measurements with shape-specific calculations"""
+        """Calculate measurements with error handling"""
         if contour is None:
-            return {}
+            return self.get_default_measurements()
         
-        x, y, w, h = cv2.boundingRect(contour)
-        
-        # Basic measurements
-        height_px = h
-        width_px = w
-        perimeter_px = cv2.arcLength(contour, True)
-        area_px = cv2.contourArea(contour)
-        
-        # Aspect ratio
-        aspect_ratio = w / h if h > 0 else 0
-        
-        # Compactness
-        compactness = (perimeter_px ** 2) / (4 * math.pi * area_px) if area_px > 0 else 0
-        
-        # Find extreme points for face measurements
-        contour_points = contour.reshape(-1, 2)
-        
-        # Find nose (leftmost point in upper half)
-        upper_half = [p for p in contour_points if p[1] < y + h/2]
-        if upper_half:
-            nose_point = min(upper_half, key=lambda p: p[0])
-        else:
-            nose_point = min(contour_points, key=lambda p: p[0])
-        
-        # Find chin (lowest point)
-        chin_point = max(contour_points, key=lambda p: p[1])
-        
-        # Face height
-        face_height_px = abs(chin_point[1] - nose_point[1])
-        
-        # Calculate major and minor axes for ellipses
-        if len(contour) >= 5:
-            ellipse = cv2.fitEllipse(contour)
-            major_axis = max(ellipse[1])
-            minor_axis = min(ellipse[1])
-            ellipse_angle = ellipse[2]
-        else:
-            major_axis = max(w, h)
-            minor_axis = min(w, h)
-            ellipse_angle = 0
-        
-        # Apply scale conversion
-        if self.pixels_to_mm_ratio:
-            height_mm = height_px * self.pixels_to_mm_ratio
-            width_mm = width_px * self.pixels_to_mm_ratio
-            perimeter_mm = perimeter_px * self.pixels_to_mm_ratio
-            area_mm2 = area_px * (self.pixels_to_mm_ratio ** 2)
-            face_height_mm = face_height_px * self.pixels_to_mm_ratio
-            major_axis_mm = major_axis * self.pixels_to_mm_ratio
-            minor_axis_mm = minor_axis * self.pixels_to_mm_ratio
-        else:
-            height_mm = width_mm = perimeter_mm = area_mm2 = face_height_mm = None
-            major_axis_mm = minor_axis_mm = None
-        
-        measurements = {
+        try:
+            x, y, w, h = cv2.boundingRect(contour)
+            
+            height_px = h
+            width_px = w
+            perimeter_px = cv2.arcLength(contour, True)
+            area_px = cv2.contourArea(contour)
+            
+            aspect_ratio = w / h if h > 0 else 0
+            compactness = (perimeter_px ** 2) / (4 * math.pi * area_px) if area_px > 0 else 0
+            
+            # Find face features
+            contour_points = contour.reshape(-1, 2)
+            
+            # Nose point
+            upper_half = [p for p in contour_points if p[1] < y + h/2]
+            nose_point = min(upper_half, key=lambda p: p[0]) if upper_half else min(contour_points, key=lambda p: p[0])
+            
+            # Chin point
+            chin_point = max(contour_points, key=lambda p: p[1])
+            face_height_px = abs(chin_point[1] - nose_point[1])
+            
+            # Ellipse fitting
+            if len(contour) >= 5:
+                ellipse = cv2.fitEllipse(contour)
+                major_axis = max(ellipse[1])
+                minor_axis = min(ellipse[1])
+                ellipse_angle = ellipse[2]
+            else:
+                major_axis = max(w, h)
+                minor_axis = min(w, h)
+                ellipse_angle = 0
+            
+            # Scale conversion
+            if self.pixels_to_mm_ratio:
+                height_mm = height_px * self.pixels_to_mm_ratio
+                width_mm = width_px * self.pixels_to_mm_ratio
+                perimeter_mm = perimeter_px * self.pixels_to_mm_ratio
+                area_mm2 = area_px * (self.pixels_to_mm_ratio ** 2)
+                face_height_mm = face_height_px * self.pixels_to_mm_ratio
+                major_axis_mm = major_axis * self.pixels_to_mm_ratio
+                minor_axis_mm = minor_axis * self.pixels_to_mm_ratio
+            else:
+                height_mm = width_mm = perimeter_mm = area_mm2 = face_height_mm = None
+                major_axis_mm = minor_axis_mm = None
+            
+            return {
+                'pixels': {
+                    'height': height_px,
+                    'width': width_px,
+                    'perimeter': perimeter_px,
+                    'area': area_px,
+                    'face_height': face_height_px,
+                    'aspect_ratio': aspect_ratio,
+                    'compactness': compactness,
+                    'major_axis': major_axis,
+                    'minor_axis': minor_axis,
+                    'ellipse_angle': ellipse_angle
+                },
+                'millimeters': {
+                    'height': height_mm,
+                    'width': width_mm,
+                    'perimeter': perimeter_mm,
+                    'area': area_mm2,
+                    'face_height': face_height_mm,
+                    'major_axis': major_axis_mm,
+                    'minor_axis': minor_axis_mm
+                } if self.pixels_to_mm_ratio else None
+            }
+        except Exception as e:
+            st.warning(f"Measurement calculation error: {str(e)}")
+            return self.get_default_measurements()
+    
+    def get_default_measurements(self):
+        """Return default measurements"""
+        return {
             'pixels': {
-                'height': height_px,
-                'width': width_px,
-                'perimeter': perimeter_px,
-                'area': area_px,
-                'face_height': face_height_px,
-                'aspect_ratio': aspect_ratio,
-                'compactness': compactness,
-                'major_axis': major_axis,
-                'minor_axis': minor_axis,
-                'ellipse_angle': ellipse_angle
+                'height': 0,
+                'width': 0,
+                'perimeter': 0,
+                'area': 0,
+                'face_height': 0,
+                'aspect_ratio': 0,
+                'compactness': 0,
+                'major_axis': 0,
+                'minor_axis': 0,
+                'ellipse_angle': 0
             },
-            'millimeters': {
-                'height': height_mm,
-                'width': width_mm,
-                'perimeter': perimeter_mm,
-                'area': area_mm2,
-                'face_height': face_height_mm,
-                'major_axis': major_axis_mm,
-                'minor_axis': minor_axis_mm
-            } if self.pixels_to_mm_ratio else None
+            'millimeters': None
         }
-        
-        return measurements
 
     def scale_normalize_with_analysis(self, image):
-        """Enhanced normalization with aspect ratio preservation"""
+        """Scale and normalize image with analysis"""
         contour = self.detect_profile_contour(image)
         
-        # Calculate measurements and shape features
+        # Get measurements and shape features
         measurements = self.calculate_measurements(contour)
         shape_features = self.analyze_shape_features(contour)
         
@@ -363,29 +387,33 @@ class EnhancedProfileMatcher:
             standardized = cv2.resize(image, (self.reference_size, self.reference_size))
             return standardized, measurements, shape_features
 
-        x, y, w, h = cv2.boundingRect(contour)
-        profile_region = image[y:y+h, x:x+w]
-        
-        # Preserve aspect ratio better
-        target_ratio = self.reference_size / max(w, h)
-        new_width = int(w * target_ratio)
-        new_height = int(h * target_ratio)
-        
-        # Resize
-        resized = cv2.resize(profile_region, (new_width, new_height), interpolation=cv2.INTER_AREA)
-        
-        # Create new canvas
-        standardized = np.ones((self.reference_size, self.reference_size), dtype=np.uint8) * 255
-        
-        # Center the resized image
-        start_x = (self.reference_size - new_width) // 2
-        start_y = (self.reference_size - new_height) // 2
-        standardized[start_y:start_y+new_height, start_x:start_x+new_width] = resized
-        
-        return standardized, measurements, shape_features
+        try:
+            x, y, w, h = cv2.boundingRect(contour)
+            profile_region = image[y:y+h, x:x+w]
+            
+            # Scale preserving aspect ratio
+            target_ratio = self.reference_size / max(w, h)
+            new_width = int(w * target_ratio)
+            new_height = int(h * target_ratio)
+            
+            # Resize
+            resized = cv2.resize(profile_region, (new_width, new_height), interpolation=cv2.INTER_AREA)
+            
+            # Create canvas
+            standardized = np.ones((self.reference_size, self.reference_size), dtype=np.uint8) * 255
+            
+            # Center the image
+            start_x = (self.reference_size - new_width) // 2
+            start_y = (self.reference_size - new_height) // 2
+            standardized[start_y:start_y+new_height, start_x:start_x+new_width] = resized
+            
+            return standardized, measurements, shape_features
+        except:
+            standardized = cv2.resize(image, (self.reference_size, self.reference_size))
+            return standardized, measurements, shape_features
 
     def preprocess_user_image(self, image):
-        """Enhanced preprocessing with shape analysis"""
+        """Preprocess user image"""
         if len(image.shape) == 3:
             gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
         else:
@@ -395,56 +423,51 @@ class EnhancedProfileMatcher:
         return standardized, measurements, shape_features
 
     def enhanced_similarity(self, user_img, template_img, user_shape_features, template_shape_features):
-        """Enhanced similarity calculation with shape features"""
-        # Base SSIM score
-        ssim_score = ssim(user_img, template_img, full=True)[0]
-        
-        # Shape feature similarity
-        shape_similarity = self.calculate_shape_similarity(user_shape_features, template_shape_features)
-        
-        # Combine scores (weighted average)
-        final_score = 0.7 * ssim_score + 0.3 * shape_similarity
-        
-        return final_score
+        """Calculate enhanced similarity score"""
+        try:
+            # Base SSIM score
+            ssim_score = ssim(user_img, template_img, full=True)[0]
+            
+            # Shape similarity
+            shape_similarity = self.calculate_shape_similarity(
+                user_shape_features or {},
+                template_shape_features or {}
+            )
+            
+            # Weighted combination
+            final_score = 0.7 * ssim_score + 0.3 * shape_similarity
+            return final_score
+        except:
+            # Fallback to SSIM only
+            return ssim(user_img, template_img, full=True)[0]
     
     def calculate_shape_similarity(self, features1, features2):
-        """Calculate similarity between shape features"""
+        """Calculate shape similarity"""
         if not features1 or not features2:
             return 0.5
         
-        # Compare key shape features
-        comparisons = []
-        
-        # Circularity similarity
-        circ_diff = 1 - abs(features1.get('circularity', 0) - features2.get('circularity', 0))
-        comparisons.append(circ_diff)
-        
-        # Angularity similarity
-        ang_diff = 1 - abs(features1.get('angularity', 0) - features2.get('angularity', 0))
-        comparisons.append(ang_diff)
-        
-        # Curvature similarity
-        curv_diff = 1 - abs(features1.get('curvature_index', 0) - features2.get('curvature_index', 0))
-        comparisons.append(curv_diff)
-        
-        # Straight edge ratio similarity
-        straight_diff = 1 - abs(features1.get('straight_edge_ratio', 0) - features2.get('straight_edge_ratio', 0))
-        comparisons.append(straight_diff)
-        
-        # Corner count similarity (normalized)
-        max_corners = max(features1.get('corner_count', 0), features2.get('corner_count', 0))
-        if max_corners > 0:
-            corner_diff = 1 - abs(features1.get('corner_count', 0) - features2.get('corner_count', 0)) / max_corners
-        else:
-            corner_diff = 1
-        comparisons.append(corner_diff)
-        
-        # Average all comparisons
-        return np.mean(comparisons)
+        try:
+            comparisons = []
+            
+            # Compare available features
+            for key in ['circularity', 'angularity', 'curvature_index', 'straight_edge_ratio']:
+                if key in features1 and key in features2:
+                    diff = 1 - abs(features1[key] - features2[key])
+                    comparisons.append(diff)
+            
+            # Corner count similarity
+            if 'corner_count' in features1 and 'corner_count' in features2:
+                max_corners = max(features1['corner_count'], features2['corner_count'])
+                if max_corners > 0:
+                    corner_diff = 1 - abs(features1['corner_count'] - features2['corner_count']) / max_corners
+                    comparisons.append(corner_diff)
+            
+            return np.mean(comparisons) if comparisons else 0.5
+        except:
+            return 0.5
 
     def find_similar_profiles(self, user_image, max_matches=5):
-        """Enhanced matching with shape features"""
-        # Ensure templates are loaded
+        """Find similar profiles"""
         self.load_templates()
         
         start_time = time.time()
@@ -453,12 +476,11 @@ class EnhancedProfileMatcher:
         matches = []
         for class_name, template_list in self.templates.items():
             for template in template_list:
-                # Use enhanced similarity
                 similarity = self.enhanced_similarity(
                     processed_user, 
                     template['standardized'],
                     user_shape_features,
-                    template['shape_features']
+                    template.get('shape_features', {})
                 )
                 
                 matches.append({
@@ -468,13 +490,13 @@ class EnhancedProfileMatcher:
                     'processed': template['standardized'],
                     'filename': template['filename'],
                     'measurements': template['measurements'],
-                    'shape_features': template['shape_features'],
+                    'shape_features': template.get('shape_features', {}),
                     'is_original': template.get('is_original', False)
                 })
 
         matches.sort(key=lambda x: x['similarity'], reverse=True)
 
-        # Get best matches
+        # Get best unique class matches
         results = []
         seen_classes = set()
         for match in matches:
@@ -488,8 +510,12 @@ class EnhancedProfileMatcher:
         return processed_user, results, user_measurements, user_shape_features
 
 def display_shape_analysis(shape_features, title="Shape Analysis"):
-    """Display detailed shape analysis"""
+    """Display shape analysis with error handling"""
     st.subheader(f"🔷 {title}")
+    
+    if not shape_features:
+        st.info("No shape features available")
+        return
     
     col1, col2 = st.columns(2)
     
@@ -500,83 +526,82 @@ def display_shape_analysis(shape_features, title="Shape Analysis"):
         shape_type = shape_features.get('shape_type', 'Unknown')
         st.metric("Shape Type", shape_type)
         
-        # Circularity gauge
+        # Circularity
         circularity = shape_features.get('circularity', 0)
         st.progress(circularity)
-        st.caption(f"Circularity: {circularity:.3f} (1.0 = perfect circle)")
+        st.caption(f"Circularity: {circularity:.3f}")
         
-        # Rectangularity gauge
+        # Rectangularity
         rectangularity = shape_features.get('rectangularity', 0)
         st.progress(rectangularity)
-        st.caption(f"Rectangularity: {rectangularity:.3f} (1.0 = perfect rectangle)")
+        st.caption(f"Rectangularity: {rectangularity:.3f}")
     
     with col2:
         st.markdown("**📊 Shape Metrics:**")
         
-        st.write(f"• **Angularity**: {shape_features.get('angularity', 0):.3f}")
-        st.write(f"• **Curvature Index**: {shape_features.get('curvature_index', 0):.3f}")
-        st.write(f"• **Straight Edge Ratio**: {shape_features.get('straight_edge_ratio', 0):.3f}")
-        st.write(f"• **Corner Count**: {shape_features.get('corner_count', 0)}")
-        st.write(f"• **Symmetry Score**: {shape_features.get('symmetry_score', 0):.3f}")
-        st.write(f"• **Compactness**: {shape_features.get('compactness', 0):.3f}")
+        metrics = [
+            ('angularity', 'Angularity'),
+            ('curvature_index', 'Curvature Index'),
+            ('straight_edge_ratio', 'Straight Edge Ratio'),
+            ('corner_count', 'Corner Count'),
+            ('symmetry_score', 'Symmetry Score'),
+            ('compactness', 'Compactness')
+        ]
+        
+        for key, label in metrics:
+            value = shape_features.get(key, 0)
+            if isinstance(value, (int, float)):
+                st.write(f"• **{label}**: {value:.3f}")
+            else:
+                st.write(f"• **{label}**: {value}")
 
 def display_measurements_with_comparison(user_measurements, match_measurements, title="Detailed Measurements"):
-    """Display measurements with comparison"""
+    """Display measurements comparison"""
     st.subheader(f"📏 {title}")
     
-    # Create comparison table
-    comparison_data = []
-    user_pixels = user_measurements['pixels']
-    match_pixels = match_measurements['pixels']
+    if not user_measurements or not match_measurements:
+        st.info("No measurements available for comparison")
+        return
     
-    metrics = [
-        ('Height', 'height', 'px'),
-        ('Width', 'width', 'px'),
-        ('Area', 'area', 'px²'),
-        ('Perimeter', 'perimeter', 'px'),
-        ('Face Height', 'face_height', 'px'),
-        ('Aspect Ratio', 'aspect_ratio', ''),
-        ('Compactness', 'compactness', ''),
-        ('Major Axis', 'major_axis', 'px'),
-        ('Minor Axis', 'minor_axis', 'px')
-    ]
-    
-    for display_name, key, unit in metrics:
-        user_val = user_pixels.get(key, 0)
-        match_val = match_pixels.get(key, 0)
+    try:
+        user_pixels = user_measurements.get('pixels', {})
+        match_pixels = match_measurements.get('pixels', {})
         
-        if user_val and match_val:
-            diff = user_val - match_val
-            diff_percent = (diff / match_val * 100) if match_val != 0 else 0
+        comparison_data = []
+        metrics = [
+            ('Height', 'height', 'px'),
+            ('Width', 'width', 'px'),
+            ('Area', 'area', 'px²'),
+            ('Perimeter', 'perimeter', 'px'),
+            ('Face Height', 'face_height', 'px')
+        ]
+        
+        for display_name, key, unit in metrics:
+            user_val = user_pixels.get(key, 0)
+            match_val = match_pixels.get(key, 0)
             
-            comparison_data.append({
-                'Metric': display_name,
-                'Your Value': f"{user_val:.1f} {unit}",
-                'Match Value': f"{match_val:.1f} {unit}",
-                'Difference': f"{diff:+.1f} {unit}",
-                'Difference %': f"{diff_percent:+.1f}%"
-            })
-    
-    if comparison_data:
-        df = pd.DataFrame(comparison_data)
-        st.table(df)
-    
-    # Display shape comparison
-    col1, col2 = st.columns(2)
-    with col1:
-        st.markdown("**📐 Your Shape Characteristics:**")
-        for key in ['aspect_ratio', 'compactness']:
-            if key in user_pixels:
-                st.write(f"• {key.replace('_', ' ').title()}: {user_pixels[key]:.3f}")
-    
-    with col2:
-        st.markdown("**📐 Match Shape Characteristics:**")
-        for key in ['aspect_ratio', 'compactness']:
-            if key in match_pixels:
-                st.write(f"• {key.replace('_', ' ').title()}: {match_pixels[key]:.3f}")
+            if user_val and match_val:
+                diff = user_val - match_val
+                diff_percent = (diff / match_val * 100) if match_val != 0 else 0
+                
+                comparison_data.append({
+                    'Metric': display_name,
+                    'Your Value': f"{user_val:.1f} {unit}",
+                    'Match Value': f"{match_val:.1f} {unit}",
+                    'Difference': f"{diff:+.1f} {unit}",
+                    'Difference %': f"{diff_percent:+.1f}%"
+                })
+        
+        if comparison_data:
+            df = pd.DataFrame(comparison_data)
+            st.table(df)
+        else:
+            st.info("No comparable measurements available")
+    except:
+        st.error("Error displaying measurements comparison")
 
 def display_interactive_results(user_img, processed_user, matches, user_measurements, user_shape_features):
-    """Display interactive results with selection capability"""
+    """Display interactive results"""
     
     st.subheader("📊 Profile Matching Results")
     
@@ -587,149 +612,134 @@ def display_interactive_results(user_img, processed_user, matches, user_measurem
     with col2:
         st.image(processed_user, caption="Normalized Input", use_column_width=True)
     
-    # Display user shape analysis
-    display_shape_analysis(user_shape_features, "Your Profile Shape Analysis")
-    
-    # Display user measurements
-    st.subheader("📏 Your Profile Measurements")
-    display_measurements_simple(user_measurements)
+    # Display user analysis
+    if user_shape_features:
+        display_shape_analysis(user_shape_features, "Your Profile Shape Analysis")
     
     # Interactive match selection
     st.subheader(f"🏆 Top {len(matches)} Matches")
-    st.info("Click on an image to select it for detailed comparison")
+    st.info("Click on a button below an image to select it for detailed comparison")
     
-    # Store selection in session state
-    if 'selected_match' not in st.session_state:
-        st.session_state.selected_match = None
+    # Initialize selection state
+    if 'selected_match_idx' not in st.session_state:
+        st.session_state.selected_match_idx = -1
     
     # Display matches in columns
     cols = st.columns(len(matches))
-    selected_idx = None
     
     for idx, (col, match) in enumerate(zip(cols, matches)):
         with col:
-            # Convert to PIL for display
-            match_img = Image.fromarray(match['processed'])
+            try:
+                match_img = Image.fromarray(match['processed'])
+            except:
+                match_img = Image.new('L', (100, 100), color=128)
             
-            # Create a button for each match
+            # Selection button
             if col.button(f"Select Match {idx+1}", key=f"select_{idx}"):
-                st.session_state.selected_match = match
+                st.session_state.selected_match_idx = idx
             
+            # Display image
             st.image(match_img, use_column_width=True)
             
             # Highlight if selected
-            if st.session_state.selected_match and st.session_state.selected_match['filename'] == match['filename']:
-                selected_idx = idx
+            is_selected = st.session_state.selected_match_idx == idx
+            if is_selected:
                 st.success(f"✅ Selected: {match['class']}")
             
+            # Display match info
             st.metric(
                 label=f"Match {idx+1}: {match['class']}",
                 value=f"{match['similarity']:.3f}"
             )
+            
+            shape_type = match.get('shape_features', {}).get('shape_type', 'Unknown')
+            st.caption(f"Shape: {shape_type}")
             st.caption(f"File: {match['filename']}")
-            st.caption(f"Shape: {match['shape_features'].get('shape_type', 'Unknown')}")
     
-    # If a match is selected, show detailed comparison
-    if st.session_state.selected_match:
-        st.markdown("---")
-        st.subheader("🎯 Selected Match Detailed Analysis")
+    # Display detailed comparison for selected match
+    if st.session_state.selected_match_idx >= 0 and st.session_state.selected_match_idx < len(matches):
+        selected_match = matches[st.session_state.selected_match_idx]
         
-        selected_match = st.session_state.selected_match
+        st.markdown("---")
+        st.subheader(f"🎯 Detailed Analysis: {selected_match['class']}")
         
         col1, col2 = st.columns(2)
         with col1:
-            st.image(Image.fromarray(selected_match['processed']), 
-                    caption=f"Selected: {selected_match['class']}", 
-                    use_column_width=True)
+            try:
+                st.image(Image.fromarray(selected_match['processed']), 
+                        caption="Selected Match", 
+                        use_column_width=True)
+            except:
+                st.warning("Could not display selected image")
             
             st.metric(
-                label=f"Similarity Score",
+                label="Similarity Score",
                 value=f"{selected_match['similarity']:.3f}",
-                delta=f"Rank: {selected_idx+1 if selected_idx is not None else 'N/A'}"
+                delta=f"Rank: {st.session_state.selected_match_idx + 1}"
             )
         
         with col2:
-            # Display shape analysis of selected match
-            display_shape_analysis(selected_match['shape_features'], 
-                                 f"Selected Match Shape Analysis")
+            # Display shape analysis
+            display_shape_analysis(selected_match.get('shape_features', {}), 
+                                 "Match Shape Analysis")
         
-        # Display detailed measurements comparison
+        # Display measurements comparison
         display_measurements_with_comparison(user_measurements, 
                                            selected_match['measurements'],
-                                           "Detailed Measurement Comparison")
+                                           "Measurement Comparison")
         
-        # Show if this is the original reference image
+        # Show original reference if available
         if selected_match.get('is_original', False):
-            st.success("🎉 This is the ORIGINAL reference image for this class!")
+            st.success("🎉 This is an ORIGINAL reference image!")
         
-        # Load and display original reference image if available
+        # Try to load and display the class's original image
         class_name = selected_match['class']
         if hasattr(st.session_state.matcher, 'original_images') and class_name in st.session_state.matcher.original_images:
-            st.subheader("📁 Original Reference Image")
+            st.subheader("📁 Original Reference Image for this Class")
             original_img = st.session_state.matcher.original_images[class_name]
-            original_pil = Image.fromarray(original_img)
             
             col1, col2 = st.columns(2)
             with col1:
-                st.image(original_pil, caption=f"Original Reference: {class_name}", use_column_width=True)
+                try:
+                    original_pil = Image.fromarray(original_img)
+                    st.image(original_pil, caption=f"Original: {class_name}", use_column_width=True)
+                except:
+                    st.warning("Could not display original image")
             
             with col2:
-                # Show original vs selected comparison
-                selected_pil = Image.fromarray(selected_match['processed'])
-                st.image(selected_pil, caption=f"Selected Match", use_column_width=True)
-                
-                # Calculate similarity between selected and original
-                if selected_match['filename'] != 'original':
-                    # Convert to arrays for comparison
-                    selected_array = np.array(selected_pil.convert('L'))
-                    original_resized = cv2.resize(original_img, (selected_array.shape[1], selected_array.shape[0]))
-                    
-                    similarity = ssim(selected_array, original_resized, full=True)[0]
-                    st.metric("Similarity to Original", f"{similarity:.3f}")
+                # Show similarity to original
+                if not selected_match.get('is_original', False):
+                    try:
+                        selected_array = np.array(Image.fromarray(selected_match['processed']).convert('L'))
+                        original_resized = cv2.resize(original_img, (selected_array.shape[1], selected_array.shape[0]))
+                        similarity = ssim(selected_array, original_resized, full=True)[0]
+                        st.metric("Similarity to Original", f"{similarity:.3f}")
+                    except:
+                        st.info("Could not calculate similarity to original")
     
-    # Display all matches in a table
+    # Display matches summary table
     st.subheader("📋 All Matches Summary")
     
     results_data = []
     for i, match in enumerate(matches, 1):
-        shape_type = match['shape_features'].get('shape_type', 'Unknown')
+        shape_features = match.get('shape_features', {})
+        shape_type = shape_features.get('shape_type', 'Unknown')
+        
         results_data.append({
             "Rank": i,
             "Class": match['class'],
             "Similarity": f"{match['similarity']:.3f}",
             "Shape Type": shape_type,
-            "Circularity": f"{match['shape_features'].get('circularity', 0):.3f}",
-            "Angularity": f"{match['shape_features'].get('angularity', 0):.3f}",
-            "Selected": "✅" if st.session_state.selected_match and 
-                             st.session_state.selected_match['filename'] == match['filename'] else ""
+            "Circularity": f"{shape_features.get('circularity', 0):.3f}",
+            "Angularity": f"{shape_features.get('angularity', 0):.3f}",
+            "Selected": "✅" if st.session_state.selected_match_idx == i-1 else ""
         })
     
-    df = pd.DataFrame(results_data)
-    st.dataframe(df, use_container_width=True)
-
-def display_measurements_simple(measurements, title="Measurements"):
-    """Display basic measurements"""
-    st.write(f"**{title}:**")
-    
-    col1, col2 = st.columns(2)
-    
-    with col1:
-        st.markdown("**📐 Pixel Measurements:**")
-        pixels = measurements['pixels']
-        st.write(f"• Height: {pixels['height']:.1f} px")
-        st.write(f"• Width: {pixels['width']:.1f} px")
-        st.write(f"• Area: {pixels['area']:.1f} px²")
-        st.write(f"• Perimeter: {pixels['perimeter']:.1f} px")
-    
-    with col2:
-        if measurements['millimeters']:
-            st.markdown("**📏 Real-world Measurements:**")
-            mm = measurements['millimeters']
-            st.write(f"• Height: {mm['height']:.1f} mm")
-            st.write(f"• Width: {mm['width']:.1f} mm")
-            st.write(f"• Area: {mm['area']:.1f} mm²")
-        else:
-            st.info("Set pixels-to-mm ratio in sidebar for real measurements")
+    try:
+        df = pd.DataFrame(results_data)
+        st.dataframe(df, use_container_width=True)
+    except:
+        st.warning("Could not display summary table")
 
 def main():
     st.set_page_config(
@@ -739,7 +749,10 @@ def main():
     )
     
     st.title("🔍 Enhanced Profile Image Matching System")
-    st.markdown("Upload a profile image to find similar matches with detailed shape analysis and measurements.")
+    
+    # Initialize session state for selection
+    if 'selected_match_idx' not in st.session_state:
+        st.session_state.selected_match_idx = -1
     
     # Sidebar configuration
     st.sidebar.header("⚙️ Configuration")
@@ -750,19 +763,19 @@ def main():
         "Pixels to mm ratio", 
         min_value=0.0, 
         max_value=10.0, 
-        value=0.264,  # Default: 0.264 mm per pixel (approx 96 DPI)
-        help="Set scale for real measurements (e.g., 0.264 = ~96 DPI)"
+        value=0.0,
+        help="Set scale for real measurements (0 = pixel measurements only)"
     )
     
-    st.sidebar.header("🔧 Advanced Settings")
-    enable_shape_analysis = st.sidebar.checkbox("Enable enhanced shape analysis", value=True)
-    show_original_images = st.sidebar.checkbox("Show original reference images", value=True)
-    
-    # Initialize matcher only once using session state
+    # Initialize matcher
     if 'matcher' not in st.session_state:
         TEMPLATE_PATH = "trained_data"
-        st.session_state.matcher = EnhancedProfileMatcher(TEMPLATE_PATH)
-        st.info("🔧 Enhanced profile matcher initialized. Ready to load templates when needed.")
+        if os.path.exists(TEMPLATE_PATH):
+            st.session_state.matcher = EnhancedProfileMatcher(TEMPLATE_PATH)
+        else:
+            st.error(f"Template path '{TEMPLATE_PATH}' not found!")
+            st.info(f"Please create a '{TEMPLATE_PATH}' folder with your template images")
+            return
     
     # Apply settings
     if pixels_to_mm > 0:
@@ -781,14 +794,21 @@ def main():
         col1, col2 = st.columns([1, 2])
         
         with col1:
-            image = Image.open(uploaded_file)
-            st.image(image, caption="Uploaded Image", use_column_width=True)
+            try:
+                image = Image.open(uploaded_file)
+                st.image(image, caption="Uploaded Image", use_column_width=True)
+            except:
+                st.error("Could not open uploaded image")
+                return
         
         with col2:
             st.info("Ready to analyze!")
             if st.button("🚀 Find Matches & Analyze", type="primary"):
                 with st.spinner("Analyzing profile and finding matches..."):
                     try:
+                        # Reset selection
+                        st.session_state.selected_match_idx = -1
+                        
                         # Convert to OpenCV format
                         user_img_cv = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
                         
@@ -803,7 +823,7 @@ def main():
                         processed_user_pil = Image.fromarray(processed_user)
                         user_img_pil = Image.fromarray(cv2.cvtColor(user_img_cv, cv2.COLOR_BGR2RGB))
                         
-                        # Display interactive results
+                        # Display results
                         display_interactive_results(
                             user_img_pil, 
                             processed_user_pil, 
@@ -814,53 +834,46 @@ def main():
                         
                     except Exception as e:
                         st.error(f"Error processing image: {str(e)}")
-                        st.info("Please try with a different image or check the image format.")
+                        st.info("Please try with a different image")
     
     # Show template status
     with st.sidebar:
         st.header("📊 System Status")
-        if st.session_state.matcher.templates:
+        if hasattr(st.session_state, 'matcher') and st.session_state.matcher.templates:
             template_count = sum(len(v) for v in st.session_state.matcher.templates.values())
             class_count = len(st.session_state.matcher.templates)
             st.success(f"✅ Templates loaded: {template_count} images, {class_count} classes")
-            
-            # Show shape distribution
-            if st.session_state.matcher.templates:
-                shape_counts = {}
-                for class_name, templates in st.session_state.matcher.templates.items():
-                    for template in templates:
-                        shape_type = template['shape_features'].get('shape_type', 'Unknown')
-                        shape_counts[shape_type] = shape_counts.get(shape_type, 0) + 1
-                
-                if shape_counts:
-                    st.write("**Shape Distribution:**")
-                    for shape_type, count in shape_counts.items():
-                        st.write(f"• {shape_type}: {count}")
         else:
-            st.info("📁 Templates not loaded yet - will load when you analyze an image")
+            st.info("📁 Templates will load when you analyze an image")
 
     # Instructions
-    with st.expander("ℹ️ How to use this enhanced system"):
+    with st.expander("ℹ️ How to use this system"):
         st.markdown("""
         **🎯 Enhanced Features:**
         1. **Better Shape Detection**: Differentiates circles, rectangles, curved vs straight shapes
-        2. **Interactive Selection**: Click on any match to get detailed comparison
-        3. **Shape Analysis**: Shows circularity, angularity, curvature, and more
-        4. **Original Reference**: Automatically finds and shows original reference images
-        5. **Detailed Measurements**: Comprehensive comparison with differences
+        2. **Interactive Selection**: Click buttons below images to select for detailed comparison
+        3. **Shape Analysis**: Shows circularity, angularity, curvature metrics
+        4. **Original Detection**: Finds and shows original reference images
+        5. **Detailed Comparison**: Side-by-side measurements with differences
         
-        **🔍 Shape Detection Capabilities:**
-        - **Circularity**: How close to a perfect circle (0-1)
-        - **Angularity**: How many corners/angles
-        - **Curvature Index**: How curved vs straight
-        - **Straight Edge Ratio**: Percentage of straight edges
-        - **Symmetry Score**: How symmetrical the shape is
+        **📁 Expected Folder Structure:**
+        ```
+        trained_data/
+        ├── Class1/
+        │   ├── original.jpg    # Auto-detected as reference
+        │   ├── image1.jpg
+        │   └── image2.jpg
+        ├── Class2/
+        │   ├── original.png
+        │   └── variant.jpg
+        └── ...
+        ```
         
-        **📊 For Best Results:**
-        - Ensure good contrast between profile and background
-        - Use clear, well-defined images
-        - Set correct pixels-to-mm ratio for accurate measurements
-        - Look for the "Original" image marker for reference quality
+        **🔍 For Best Results:**
+        - Use clear images with good contrast
+        - Ensure profiles are clearly visible
+        - Set pixels-to-mm ratio for real measurements
+        - Look for "Original" marker for reference quality
         """)
 
 if __name__ == "__main__":
