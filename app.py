@@ -336,7 +336,7 @@ def main():
         layout="wide"
     )
     
-    st.title("🔍 Profile Matching System")
+    st.title("🔍 ALU SCAN - The Aluminum Porfile Search Engine")
     st.markdown("Upload an image to find similar profiles")
     
     # Sidebar configuration
@@ -474,3 +474,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
