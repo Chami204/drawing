@@ -1,219 +1,410 @@
 import cv2
 import numpy as np
 import os
-from skimage.metrics import structural_similarity as ssim
 import streamlit as st
 from PIL import Image
 import time
-import math
+import torch
+import torch.nn as nn
+import torchvision.transforms as transforms
+import torchvision.models as models
+import faiss
+from sklearn.preprocessing import normalize
+import matplotlib.pyplot as plt
 
-class OptimizedProfileMatcher:
-    def __init__(self, template_root):
-        self.template_root = template_root
-        self.templates = {}
-        self.reference_size = 300
-        self.template_hashes = {}
-
-    def load_templates(self):
-        if self.templates:
-            return
-            
-        st.write("📂 Loading templates...")
-        start_time = time.time()
-
-        for class_name in os.listdir(self.template_root):
-            class_path = os.path.join(self.template_root, class_name)
-            if os.path.isdir(class_path):
-                class_images = []
-                for img_file in os.listdir(class_path):
-                    if img_file.lower().endswith(('.png', '.jpg', '.jpeg')):
-                        img_path = os.path.join(class_path, img_file)
-                        img = cv2.imread(img_path, cv2.IMREAD_GRAYSCALE)
-                        if img is not None:
-                            standardized = self.fast_normalize(img, preserve_aspect=True)
-                            img_hash = self.compute_image_hash(standardized)
-                            
-                            class_images.append({
-                                'original': img,
-                                'standardized': standardized,
-                                'filename': os.path.basename(img_path),
-                                'class': class_name,
-                                'hash': img_hash
-                            })
-                            
-                            self.template_hashes[img_hash] = {
-                                'class': class_name,
-                                'filename': img_file,
-                                'standardized': standardized
-                            }
-                if class_images:
-                    self.templates[class_name] = class_images
-
-        st.success(f"✅ Loaded {sum(len(v) for v in self.templates.values())} templates from {len(self.templates)} classes in {time.time()-start_time:.2f} seconds")
-
-    def compute_image_hash(self, image):
-        small = cv2.resize(image, (8, 8))
-        avg = np.mean(small)
-        hash_value = 0
-        for i in range(8):
-            for j in range(8):
-                if small[i, j] > avg:
-                    hash_value |= 1 << (i * 8 + j)
-        return hash_value
-
-    def fast_normalize(self, image, preserve_aspect=True):
-        """Normalize image while preserving original proportions"""
+class VisionProcessor:
+    """Eye (Vision): OpenCV + Morphological Operations"""
+    def __init__(self):
+        self.reference_size = 224
+        
+    def preprocess_image(self, image):
+        """Enhanced preprocessing with morphological operations"""
         if len(image.shape) == 3:
             gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
         else:
             gray = image.copy()
         
-        _, thresh = cv2.threshold(gray, 200, 255, cv2.THRESH_BINARY_INV)
-        contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        # 1. Adaptive thresholding for better binarization
+        binary = cv2.adaptiveThreshold(
+            gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
+            cv2.THRESH_BINARY_INV, 11, 2
+        )
+        
+        # 2. Morphological operations to clean the image
+        kernel = np.ones((3, 3), np.uint8)
+        
+        # Opening to remove noise
+        cleaned = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel)
+        
+        # Closing to fill small holes
+        cleaned = cv2.morphologyEx(cleaned, cv2.MORPH_CLOSE, kernel)
+        
+        # 3. Find largest contour
+        contours, _ = cv2.findContours(
+            cleaned, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+        )
         
         if not contours:
-            # If no contour found, return original size resized to fit
-            h, w = gray.shape
-            scale = self.reference_size / max(h, w)
-            new_h, new_w = int(h * scale), int(w * scale)
-            return cv2.resize(gray, (new_w, new_h))
+            return self._simple_resize(gray)
         
+        # Get the largest contour
         contour = max(contours, key=cv2.contourArea)
         x, y, w, h = cv2.boundingRect(contour)
         
-        # Extract the profile region
-        profile_region = gray[y:y+h, x:x+w]
+        # Extract region of interest
+        roi = gray[y:y+h, x:x+w]
         
-        if preserve_aspect:
-            # Preserve original aspect ratio - fit within reference_size
-            scale = self.reference_size / max(w, h)
-            new_width = int(w * scale)
-            new_height = int(h * scale)
-            
-            # Resize preserving aspect ratio
-            resized = cv2.resize(profile_region, (new_width, new_height), interpolation=cv2.INTER_AREA)
-            
-            # Create a canvas of reference_size x reference_size with white background
-            result = np.ones((self.reference_size, self.reference_size), dtype=np.uint8) * 255
-            
-            # Calculate position to center the resized image
-            x_offset = (self.reference_size - new_width) // 2
-            y_offset = (self.reference_size - new_height) // 2
-            
-            # Place the resized image in the center
-            result[y_offset:y_offset+new_height, x_offset:x_offset+new_width] = resized
-            
-            return result
+        # 4. Create mask from cleaned contour
+        mask = np.zeros_like(gray)
+        cv2.drawContours(mask, [contour], -1, 255, -1)
+        mask = mask[y:y+h, x:x+w]
+        
+        # Apply mask
+        masked_roi = cv2.bitwise_and(roi, roi, mask=mask)
+        
+        # 5. Normalize while preserving aspect ratio
+        result = self._preserve_aspect_resize(masked_roi)
+        
+        return result
+    
+    def _preserve_aspect_resize(self, image):
+        """Resize image while preserving aspect ratio"""
+        h, w = image.shape
+        
+        # Calculate scaling factor
+        scale = self.reference_size / max(h, w)
+        new_h, new_w = int(h * scale), int(w * scale)
+        
+        # Resize
+        resized = cv2.resize(image, (new_w, new_h), interpolation=cv2.INTER_AREA)
+        
+        # Create square canvas with white background
+        canvas = np.ones((self.reference_size, self.reference_size), dtype=np.uint8) * 255
+        
+        # Calculate position to center the image
+        x_offset = (self.reference_size - new_w) // 2
+        y_offset = (self.reference_size - new_h) // 2
+        
+        # Place image on canvas
+        canvas[y_offset:y_offset+new_h, x_offset:x_offset+new_w] = resized
+        
+        return canvas
+    
+    def _simple_resize(self, image):
+        """Fallback resize method"""
+        return cv2.resize(image, (self.reference_size, self.reference_size))
+
+class FeatureExtractor:
+    """Brain (AI): PyTorch + ResNet18 for feature extraction"""
+    def __init__(self):
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.model = self._load_model()
+        self.transform = self._get_transform()
+        
+    def _load_model(self):
+        """Load pre-trained ResNet18 model"""
+        model = models.resnet18(pretrained=True)
+        
+        # Remove the final classification layer
+        model = nn.Sequential(*list(model.children())[:-1])
+        
+        # Set to evaluation mode
+        model.eval()
+        model.to(self.device)
+        
+        return model
+    
+    def _get_transform(self):
+        """Get image transformations for ResNet"""
+        return transforms.Compose([
+            transforms.ToPILImage(),
+            transforms.Resize((224, 224)),
+            transforms.ToTensor(),
+            transforms.Normalize(
+                mean=[0.485, 0.456, 0.406],
+                std=[0.229, 0.224, 0.225]
+            )
+        ])
+    
+    def extract_features(self, image):
+        """Extract features from image using ResNet18"""
+        # Ensure 3 channels (RGB)
+        if len(image.shape) == 2:
+            image_rgb = cv2.cvtColor(image, cv2.COLOR_GRAY2RGB)
         else:
-            # Original behavior - stretch to square
-            return cv2.resize(profile_region, (self.reference_size, self.reference_size), interpolation=cv2.INTER_AREA)
-
-    def fast_similarity(self, img1, img2):
-        hash1 = self.compute_image_hash(img1)
-        hash2 = self.compute_image_hash(img2)
+            image_rgb = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
         
-        if hash1 == hash2:
-            return 1.0
+        # Apply transformations
+        image_tensor = self.transform(image_rgb)
+        image_tensor = image_tensor.unsqueeze(0).to(self.device)
         
-        try:
-            if img1.shape[0] > 150:
-                img1_small = cv2.resize(img1, (150, 150))
-                img2_small = cv2.resize(img2, (150, 150))
-                similarity = ssim(img1_small, img2_small)
-            else:
-                similarity = ssim(img1, img2)
-            
-            edges1 = cv2.Canny(img1, 50, 150)
-            edges2 = cv2.Canny(img2, 50, 150)
-            
-            edge_match = np.sum(edges1 & edges2) / max(np.sum(edges1), np.sum(edges2)) if max(np.sum(edges1), np.sum(edges2)) > 0 else 0
-            
-            final_score = 0.8 * similarity + 0.2 * edge_match
-            
-            return min(final_score, 1.0)
-        except:
-            return ssim(img1, img2)
+        # Extract features
+        with torch.no_grad():
+            features = self.model(image_tensor)
+        
+        # Flatten features
+        features = features.squeeze().cpu().numpy()
+        
+        # Normalize features
+        features = normalize(features.reshape(1, -1)).flatten()
+        
+        return features
 
+class MemoryDatabase:
+    """Memory (Database): FAISS for similarity search"""
+    def __init__(self, dimension=512):
+        self.dimension = dimension
+        self.index = None
+        self.template_info = []
+        
+    def build_index(self, features_list):
+        """Build FAISS index from features"""
+        # Convert list of features to numpy array
+        features_array = np.array(features_list).astype('float32')
+        
+        # Create FAISS index
+        self.index = faiss.IndexFlatL2(self.dimension)
+        
+        # Add features to index
+        self.index.add(features_array)
+        
+        return self.index
+    
+    def search(self, query_features, k=5):
+        """Search for similar items in database"""
+        if self.index is None:
+            raise ValueError("Index not built. Call build_index first.")
+        
+        # Prepare query features
+        query_array = np.array([query_features]).astype('float32')
+        
+        # Search
+        distances, indices = self.index.search(query_array, k)
+        
+        return distances[0], indices[0]
+    
+    def add_template_info(self, info):
+        """Add template information for retrieval"""
+        self.template_info.append(info)
+
+class EnhancedProfileMatcher:
+    def __init__(self, template_root):
+        self.template_root = template_root
+        
+        # Initialize components
+        self.vision = VisionProcessor()
+        self.brain = FeatureExtractor()
+        self.memory = MemoryDatabase()
+        
+        # Storage for templates
+        self.templates_loaded = False
+        self.templates_info = []
+        
+    def load_templates(self):
+        """Load and process all template images"""
+        if self.templates_loaded:
+            return
+        
+        st.write("🧠 Loading and processing templates...")
+        start_time = time.time()
+        
+        features_list = []
+        
+        for class_name in os.listdir(self.template_root):
+            class_path = os.path.join(self.template_root, class_name)
+            if os.path.isdir(class_path):
+                for img_file in os.listdir(class_path):
+                    if img_file.lower().endswith(('.png', '.jpg', '.jpeg')):
+                        img_path = os.path.join(class_path, img_file)
+                        
+                        # Load image
+                        img = cv2.imread(img_path, cv2.IMREAD_GRAYSCALE)
+                        if img is None:
+                            continue
+                        
+                        # Preprocess with Vision
+                        processed_img = self.vision.preprocess_image(img)
+                        
+                        # Extract features with Brain
+                        features = self.brain.extract_features(processed_img)
+                        
+                        # Store in memory
+                        self.memory.add_template_info({
+                            'class': class_name,
+                            'filename': img_file,
+                            'processed_image': processed_img,
+                            'original_path': img_path,
+                            'features': features
+                        })
+                        
+                        features_list.append(features)
+        
+        # Build FAISS index
+        if features_list:
+            self.memory.build_index(features_list)
+            self.templates_loaded = True
+            
+            st.success(f"""
+            ✅ System initialized:
+            - Vision: {len(features_list)} images preprocessed
+            - Brain: ResNet18 feature extraction ready
+            - Memory: FAISS index built with {len(features_list)} vectors
+            Time: {time.time()-start_time:.2f} seconds
+            """)
+    
     def find_similar_profiles(self, user_image, max_matches=5):
+        """Find similar profiles using the complete system"""
         self.load_templates()
         
         start_time = time.time()
         
-        if len(user_image.shape) == 3:
-            user_gray = cv2.cvtColor(user_image, cv2.COLOR_BGR2GRAY)
-        else:
-            user_gray = user_image.copy()
+        # Process user image through Vision
+        user_processed = self.vision.preprocess_image(user_image)
         
-        user_standardized = self.fast_normalize(user_gray, preserve_aspect=True)
-        user_hash = self.compute_image_hash(user_standardized)
+        # Extract features through Brain
+        user_features = self.brain.extract_features(user_processed)
         
-        # Check for exact match first
-        exact_matches = []
-        if user_hash in self.template_hashes:
-            exact_match = self.template_hashes[user_hash]
-            exact_matches.append({
-                'similarity': 1.0,
-                'class': exact_match['class'],
-                'filename': exact_match['filename'],
-                'standardized': exact_match['standardized'],
-                'is_exact_match': True
-            })
+        # Search in Memory
+        distances, indices = self.memory.search(user_features, k=max_matches)
         
-        if exact_matches:
-            st.write(f"✅ Found exact match in {time.time()-start_time:.2f} seconds!")
-            return user_standardized, exact_matches[:max_matches]
-        
+        # Prepare results
         matches = []
-        
-        for class_name, template_list in self.templates.items():
-            for template in template_list:
-                similarity = self.fast_similarity(user_standardized, template['standardized'])
+        for idx, distance in zip(indices, distances):
+            if idx < len(self.memory.template_info):
+                template_info = self.memory.template_info[idx]
+                
+                # Convert distance to similarity score (0-1)
+                similarity = max(0, 1 - distance / 10)  # Adjust scaling as needed
                 
                 matches.append({
-                    'similarity': similarity,
-                    'class': class_name,
-                    'image': template['original'],
-                    'processed': template['standardized'],
-                    'filename': template['filename']
+                    'similarity': float(similarity),
+                    'distance': float(distance),
+                    'class': template_info['class'],
+                    'filename': template_info['filename'],
+                    'processed': template_info['processed_image'],
+                    'original_path': template_info['original_path']
                 })
-
+        
+        # Sort by similarity (descending)
         matches.sort(key=lambda x: x['similarity'], reverse=True)
-
-        results = []
-        seen_classes = set()
-        for match in matches:
-            if match['class'] not in seen_classes:
-                results.append(match)
-                seen_classes.add(match['class'])
-                if len(results) >= max_matches:
-                    break
         
         st.write(f"⏱️ Matching completed in {time.time()-start_time:.2f} seconds")
-        return user_standardized, results
+        
+        return user_processed, matches
+    
+    def visualize_processing_pipeline(self, image):
+        """Visualize each step of the processing pipeline"""
+        # Convert to grayscale if needed
+        if len(image.shape) == 3:
+            gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        else:
+            gray = image.copy()
+        
+        # Step 1: Original
+        fig, axes = plt.subplots(2, 3, figsize=(15, 10))
+        axes[0, 0].imshow(gray, cmap='gray')
+        axes[0, 0].set_title('1. Original Image')
+        axes[0, 0].axis('off')
+        
+        # Step 2: Adaptive Threshold
+        binary = cv2.adaptiveThreshold(
+            gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, 
+            cv2.THRESH_BINARY_INV, 11, 2
+        )
+        axes[0, 1].imshow(binary, cmap='gray')
+        axes[0, 1].set_title('2. Adaptive Threshold')
+        axes[0, 1].axis('off')
+        
+        # Step 3: Morphological Cleaning
+        kernel = np.ones((3, 3), np.uint8)
+        cleaned = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel)
+        cleaned = cv2.morphologyEx(cleaned, cv2.MORPH_CLOSE, kernel)
+        axes[0, 2].imshow(cleaned, cmap='gray')
+        axes[0, 2].set_title('3. Morphological Operations')
+        axes[0, 2].axis('off')
+        
+        # Step 4: Contour Detection
+        contours, _ = cv2.findContours(
+            cleaned, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE
+        )
+        contour_img = cv2.cvtColor(gray, cv2.COLOR_GRAY2RGB)
+        if contours:
+            contour = max(contours, key=cv2.contourArea)
+            cv2.drawContours(contour_img, [contour], -1, (0, 255, 0), 2)
+        axes[1, 0].imshow(contour_img)
+        axes[1, 0].set_title('4. Contour Detection')
+        axes[1, 0].axis('off')
+        
+        # Step 5: Extracted Profile
+        if contours:
+            x, y, w, h = cv2.boundingRect(contour)
+            roi = gray[y:y+h, x:x+w]
+            mask = np.zeros_like(gray)
+            cv2.drawContours(mask, [contour], -1, 255, -1)
+            mask = mask[y:y+h, x:x+w]
+            masked_roi = cv2.bitwise_and(roi, roi, mask=mask)
+            axes[1, 1].imshow(masked_roi, cmap='gray')
+        else:
+            axes[1, 1].imshow(gray, cmap='gray')
+        axes[1, 1].set_title('5. Extracted Profile')
+        axes[1, 1].axis('off')
+        
+        # Step 6: Final Normalized
+        final = self.vision.preprocess_image(image)
+        axes[1, 2].imshow(final, cmap='gray')
+        axes[1, 2].set_title('6. Final Normalized')
+        axes[1, 2].axis('off')
+        
+        plt.tight_layout()
+        
+        return fig
+
+def display_system_dashboard(matcher):
+    """Display system information dashboard"""
+    st.sidebar.markdown("## 🏗️ System Architecture")
+    
+    col1, col2, col3 = st.sidebar.columns(3)
+    
+    with col1:
+        st.markdown("**👁️ Vision**")
+        st.caption("OpenCV + Morphological Ops")
+        st.caption("Image Cleaning & Normalization")
+    
+    with col2:
+        st.markdown("**🧠 Brain**")
+        st.caption("PyTorch + ResNet18")
+        st.caption("Feature Extraction")
+    
+    with col3:
+        st.markdown("**💾 Memory**")
+        st.caption("FAISS Database")
+        st.caption("Similarity Search")
+    
+    if hasattr(matcher, 'templates_loaded') and matcher.templates_loaded:
+        st.sidebar.success("✅ System Ready")
+        st.sidebar.metric("Templates Loaded", len(matcher.memory.template_info))
+    else:
+        st.sidebar.warning("⚠️ System Initializing...")
 
 def display_results_with_selection(user_img, processed_user, matches):
     """Display results with interactive selection"""
     
-    st.subheader("📊 Profile Matching Results")
+    st.subheader("🔍 Matching Results")
     
     # Display input images
     col1, col2 = st.columns(2)
     with col1:
         st.image(user_img, caption="Original Input", use_column_width=True)
     with col2:
-        st.image(processed_user, caption="Normalized (Preserved Aspect Ratio)", use_column_width=True)
+        st.image(processed_user, caption="Enhanced Processing", use_column_width=True)
     
-    # Show exact match notification
-    if matches and matches[0].get('is_exact_match', False):
-        st.success(f"🎯 EXACT MATCH FOUND: {matches[0]['class']}")
-    
-    # 1. FIRST: Show all similar matches for selection
-    st.subheader("🎯 Select a Match (Click on an image)")
+    # 1. Show all similar matches for selection
+    st.subheader("🎯 Select a Match")
     st.info("Click on any image below to select it as your best match")
     
     # Initialize selection in session state
     if 'selected_match_idx' not in st.session_state:
-        st.session_state.selected_match_idx = 0  # Default to first match
+        st.session_state.selected_match_idx = 0
     
     # Use callback functions for button clicks
     def set_selected_idx(idx):
@@ -227,8 +418,6 @@ def display_results_with_selection(user_img, processed_user, matches):
         with col:
             # Create a clickable container for each match
             match_img = Image.fromarray(match['processed'])
-            
-            # Check if this match is currently selected
             is_selected = st.session_state.selected_match_idx == idx
             
             # Display image with border if selected
@@ -244,7 +433,7 @@ def display_results_with_selection(user_img, processed_user, matches):
             
             # Add click functionality
             col.button(
-                f"Select Match {idx+1}", 
+                f"Select #{idx+1}", 
                 key=f"select_{idx}",
                 on_click=set_selected_idx,
                 args=(idx,)
@@ -252,18 +441,14 @@ def display_results_with_selection(user_img, processed_user, matches):
             
             # Show match info
             similarity_value = match['similarity']
-            if similarity_value == 1.0 and match.get('is_exact_match', False):
-                col.success(f"Exact Match")
-            else:
-                col.metric(f"Similarity", f"{similarity_value:.3f}")
-            
+            col.metric(f"Similarity", f"{similarity_value:.3f}")
             col.caption(f"Class: {match['class']}")
-            col.caption(f"File: {match['filename']}")
+            col.caption(f"Distance: {match['distance']:.4f}")
             
             if is_selected:
                 col.success("✅ Selected")
     
-    # 2. THEN: Show the selected match as best match
+    # Show the selected match as best match
     if selected_match is None and len(matches) > 0:
         selected_match = matches[st.session_state.selected_match_idx]
     
@@ -273,85 +458,86 @@ def display_results_with_selection(user_img, processed_user, matches):
         # Show the selected match as "Best Match"
         st.subheader(f"🏆 Best Match: {selected_match['class']}")
         
-        col1, col2 = st.columns([2, 1])
+        col1, col2, col3 = st.columns([3, 2, 1])
         
         with col1:
-            # Show the selected match image
             selected_img = Image.fromarray(selected_match['processed'])
-            
-            # Get original image dimensions if available
-            if 'image' in selected_match and selected_match['image'] is not None:
-                original_img = selected_match['image']
-                if isinstance(original_img, np.ndarray):
-                    h, w = original_img.shape[:2]
-                    st.caption(f"Original size: {w}×{h} pixels")
-            
-            st.image(selected_img, caption=f"Selected as Best Match (Preserved Aspect Ratio)", use_column_width=True)
-            
-            # Show similarity score
-            similarity_value = selected_match['similarity']
-            if similarity_value == 1.0 and selected_match.get('is_exact_match', False):
-                st.success("🎯 Perfect Match (100% identical)")
-            else:
-                st.metric("Similarity Score", f"{similarity_value:.3f}")
-            
-            st.caption(f"File: {selected_match['filename']}")
-            st.caption(f"Rank: {st.session_state.selected_match_idx + 1} of {len(matches)}")
+            st.image(selected_img, caption=f"Selected Match (Class: {selected_match['class']})", use_column_width=True)
         
         with col2:
-            # Show match details
             st.markdown("**📊 Match Details**")
             st.write(f"**Class:** {selected_match['class']}")
-            st.write(f"**Similarity:** {selected_match['similarity']:.3f}")
             st.write(f"**Filename:** {selected_match['filename']}")
+            st.write(f"**Similarity Score:** {selected_match['similarity']:.4f}")
+            st.write(f"**FAISS Distance:** {selected_match['distance']:.4f}")
             
-            if selected_match.get('is_exact_match', False):
-                st.success("**Type:** Exact Match")
+            # Show quality indicators
+            if selected_match['similarity'] > 0.9:
+                st.success("**Quality:** Excellent Match")
+            elif selected_match['similarity'] > 0.7:
+                st.info("**Quality:** Good Match")
+            elif selected_match['similarity'] > 0.5:
+                st.warning("**Quality:** Fair Match")
             else:
-                st.info("**Type:** Similar Match")
+                st.error("**Quality:** Poor Match")
         
-        # 4. Show all matches summary table
+        with col3:
+            st.markdown("**📈 Metrics**")
+            st.metric("Similarity", f"{selected_match['similarity']:.3%}")
+            st.metric("Distance", f"{selected_match['distance']:.4f}")
+            st.caption(f"Rank: #{st.session_state.selected_match_idx + 1}")
+        
+        # Show all matches summary
         st.subheader("📋 All Matches Summary")
         
         import pandas as pd
         summary_data = []
         for i, match in enumerate(matches, 1):
             is_selected = i-1 == st.session_state.selected_match_idx
-            
             summary_data.append({
                 "Rank": i,
                 "Class": match['class'],
                 "Similarity": f"{match['similarity']:.3f}",
-                "Type": "Exact" if match.get('is_exact_match', False) else "Similar",
+                "Distance": f"{match['distance']:.4f}",
                 "Selected": "✅" if is_selected else ""
             })
         
         df = pd.DataFrame(summary_data)
-        st.table(df)
+        st.dataframe(df, use_container_width=True)
 
 def main():
     st.set_page_config(
-        page_title="Profile Matcher",
+        page_title="ALU SCAN Pro",
         page_icon="🔍",
         layout="wide"
     )
     
-    st.title("🔍 ALU SCAN - The Aluminum Profile Search Engine")
-    st.markdown("Upload an image to find similar profiles")
+    st.title("🔍 ALU SCAN Pro - Advanced Profile Matching")
+    st.markdown("""
+    **Advanced Profile Matching System**
+    - 👁️ **Vision**: OpenCV + Morphological Operations
+    - 🧠 **Brain**: PyTorch ResNet18 Feature Extraction  
+    - 💾 **Memory**: FAISS Similarity Search Database
+    """)
     
     # Sidebar configuration
     st.sidebar.header("⚙️ Configuration")
     max_matches = st.sidebar.slider("Matches to show", 1, 10, 5)
+    show_processing = st.sidebar.checkbox("Show Processing Pipeline", True)
     
     # Initialize matcher in session state
     if 'matcher' not in st.session_state:
         TEMPLATE_PATH = "trained_data"
         if os.path.exists(TEMPLATE_PATH):
-            st.session_state.matcher = OptimizedProfileMatcher(TEMPLATE_PATH)
-            st.info("🔍 Profile matcher initialized")
+            st.session_state.matcher = EnhancedProfileMatcher(TEMPLATE_PATH)
+            st.info("🚀 Initializing ALU SCAN Pro System...")
         else:
-            st.error(f"Folder '{TEMPLATE_PATH}' not found!")
+            st.error(f"❌ Template folder '{TEMPLATE_PATH}' not found!")
+            st.info("Please create a 'trained_data' folder with class subfolders containing profile images.")
             return
+    
+    # Display system dashboard
+    display_system_dashboard(st.session_state.matcher)
     
     # Initialize session state variables
     if 'processed_user' not in st.session_state:
@@ -365,10 +551,9 @@ def main():
     
     # File upload
     uploaded_file = st.file_uploader(
-        "Upload profile image", 
+        "📤 Upload Profile Image", 
         type=['png', '.jpg', '.jpeg'],
-        help="Upload image for matching",
-        key="file_uploader"
+        help="Upload an image of an aluminum profile for matching"
     )
     
     if uploaded_file is not None:
@@ -376,44 +561,49 @@ def main():
         
         with col1:
             image = Image.open(uploaded_file)
-            st.image(image, caption="Uploaded", use_column_width=True)
+            st.image(image, caption="Uploaded Image", use_column_width=True)
         
         with col2:
             # Check if we need to analyze or re-analyze
             analyze_needed = True
             if st.session_state.analysis_done:
-                # Check if this is the same file (by comparing first few bytes)
                 current_file_bytes = uploaded_file.getvalue()[:100]
                 if 'last_file_bytes' in st.session_state:
                     if current_file_bytes == st.session_state.last_file_bytes:
                         analyze_needed = False
             
             if analyze_needed:
-                if st.button("🔍 Find Matches", type="primary"):
-                    with st.spinner("Finding matches..."):
+                if st.button("🔍 Find Matches", type="primary", use_container_width=True):
+                    with st.spinner("🧠 Processing image through Vision → Brain → Memory..."):
                         try:
-                            # Store file bytes for comparison
+                            # Store file bytes
                             st.session_state.last_file_bytes = uploaded_file.getvalue()[:100]
                             
                             # Reset selection
                             st.session_state.selected_match_idx = 0
                             
-                            start_time = time.time()
+                            # Convert to OpenCV format
                             user_img_cv = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
                             
-                            # Perform analysis
+                            # Show processing pipeline visualization
+                            if show_processing:
+                                with st.expander("🔬 Processing Pipeline Visualization", expanded=True):
+                                    fig = st.session_state.matcher.visualize_processing_pipeline(user_img_cv)
+                                    st.pyplot(fig)
+                            
+                            # Perform matching
+                            start_time = time.time()
                             processed_user, matches = st.session_state.matcher.find_similar_profiles(
                                 user_img_cv, 
                                 max_matches=max_matches
                             )
-                            
                             total_time = time.time() - start_time
                             
-                            # Convert images for display
+                            # Convert for display
                             processed_user_pil = Image.fromarray(processed_user)
                             user_img_pil = Image.fromarray(cv2.cvtColor(user_img_cv, cv2.COLOR_BGR2RGB))
                             
-                            # Store everything in session state
+                            # Store results
                             st.session_state.processed_user = processed_user_pil
                             st.session_state.matches = matches
                             st.session_state.user_img_pil = user_img_pil
@@ -424,55 +614,93 @@ def main():
                             
                         except Exception as e:
                             st.error(f"Error: {str(e)}")
+                            st.exception(e)
             else:
-                # Show re-analyze option
                 if st.button("🔄 Re-analyze", type="secondary"):
                     st.session_state.analysis_done = False
                     st.rerun()
     
     # Display results if analysis is done
     if st.session_state.analysis_done and st.session_state.matches is not None:
-        # Show analysis time in sidebar
+        # Show analysis time
         if 'analysis_time' in st.session_state:
-            st.sidebar.success(f"Analysis time: {st.session_state.analysis_time:.2f} seconds")
+            st.sidebar.metric("Processing Time", f"{st.session_state.analysis_time:.2f}s")
         
-        # Display the results with selection
+        # Display results
         display_results_with_selection(
             st.session_state.user_img_pil, 
             st.session_state.processed_user, 
             st.session_state.matches
         )
     
-    # Status
+    # Instructions and info
     with st.sidebar:
-        if hasattr(st.session_state, 'matcher'):
-            if st.session_state.matcher.templates:
-                template_count = sum(len(v) for v in st.session_state.matcher.templates.values())
-                st.success(f"✅ {template_count} templates loaded")
+        st.markdown("---")
+        st.markdown("**🎯 How to Use:**")
+        st.markdown("1. 📤 Upload profile image")
+        st.markdown("2. 🔍 Click 'Find Matches'")
+        st.markdown("3. 🖱️ Click any match to select")
+        st.markdown("4. 📊 Review selected match details")
         
         st.markdown("---")
-        st.markdown("**🎯 Instructions:**")
-        st.markdown("1. Upload an image")
-        st.markdown("2. Click 'Find Matches'")
-        st.markdown("3. Click on any match image to select it")
-        st.markdown("4. Selected match shown as Best Match")
-
-    with st.expander("ℹ️ How to use"):
-        st.markdown("""
-        **🔍 Features:**
-        1. **Clickable Images**: Click on any match to select it
-        2. **Exact Match Detection**: Identical images show as 100% match
-        3. **Preserved Aspect Ratio**: Images shown in original proportions
-        4. **Fast Matching**: Optimized for speed
+        st.markdown("**🔧 System Info:**")
+        if torch.cuda.is_available():
+            st.success("GPU Acceleration: ✅ Available")
+        else:
+            st.info("GPU Acceleration: ⚠️ CPU Only")
         
-        **📊 Workflow:**
-        1. All matches shown first for selection
-        2. Click any image to select it as "Best Match"
-        3. Selected match shown with details
-        4. No measurements - focus on visual similarity
+        # System status
+        if hasattr(st.session_state, 'matcher'):
+            if st.session_state.matcher.templates_loaded:
+                template_count = len(st.session_state.matcher.memory.template_info)
+                st.metric("Database Size", f"{template_count} profiles")
+    
+    # How it works expander
+    with st.expander("🔬 How ALU SCAN Pro Works", expanded=False):
+        st.markdown("""
+        ### 🏗️ Three-Part Architecture
+        
+        **👁️ Vision (OpenCV + Morphological Operations)**
+        ```
+        1. Adaptive Thresholding - Smart binarization
+        2. Morphological Operations - Noise removal & cleaning
+        3. Contour Detection - Profile extraction
+        4. Aspect Ratio Preservation - Maintains proportions
+        ```
+        
+        **🧠 Brain (PyTorch + ResNet18)**
+        ```
+        1. Feature Extraction - 512-dimensional vectors
+        2. Geometric Understanding - Shape & structure analysis
+        3. Deep Learning - Pre-trained on ImageNet
+        4. Normalization - Consistent feature scaling
+        ```
+        
+        **💾 Memory (FAISS Database)**
+        ```
+        1. Vector Storage - Efficient feature indexing
+        2. Similarity Search - L2 distance calculations
+        3. Fast Retrieval - Optimized for large datasets
+        4. Scalable - Handles thousands of profiles
+        ```
+        
+        ### 📊 Workflow
+        1. **Upload** → User provides profile image
+        2. **Vision Processing** → Image cleaning & normalization
+        3. **Feature Extraction** → Convert to 512D vector
+        4. **Database Search** → Find similar vectors in FAISS
+        5. **Results Display** → Show ranked matches
         """)
 
 if __name__ == "__main__":
+    # Install instructions
+    st.sidebar.markdown("---")
+    st.sidebar.markdown("**📦 Required Packages:**")
+    st.sidebar.code("""
+    pip install streamlit opencv-python
+    pip install torch torchvision
+    pip install faiss-cpu  # or faiss-gpu
+    pip install scikit-learn matplotlib
+    """)
+    
     main()
-
-
