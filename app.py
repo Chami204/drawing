@@ -128,7 +128,7 @@ class OptimizedProfileMatcher:
             
             edge_match = np.sum(edges1 & edges2) / max(np.sum(edges1), np.sum(edges2)) if max(np.sum(edges1), np.sum(edges2)) > 0 else 0
             
-            final_score = 0.8 * similarity + 0.2 * edge_match
+            final_score = 0.6 * similarity + 0.4 * edge_match
             
             return min(final_score, 1.0)
         except:
@@ -474,5 +474,6 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
 
