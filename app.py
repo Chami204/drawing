@@ -33,18 +33,23 @@ class OptimizedProfileMatcher:
                             standardized = self.fast_normalize(img, preserve_aspect=True)
                             img_hash = self.compute_image_hash(standardized)
                             
+                            # Detect shape type for each template
+                            shape_type = self.detect_shape_type(standardized)
+                            
                             class_images.append({
                                 'original': img,
                                 'standardized': standardized,
                                 'filename': os.path.basename(img_path),
                                 'class': class_name,
-                                'hash': img_hash
+                                'hash': img_hash,
+                                'shape_type': shape_type  # Store shape type
                             })
                             
                             self.template_hashes[img_hash] = {
                                 'class': class_name,
                                 'filename': img_file,
-                                'standardized': standardized
+                                'standardized': standardized,
+                                'shape_type': shape_type
                             }
                 if class_images:
                     self.templates[class_name] = class_images
@@ -108,6 +113,106 @@ class OptimizedProfileMatcher:
             # Original behavior - stretch to square
             return cv2.resize(profile_region, (self.reference_size, self.reference_size), interpolation=cv2.INTER_AREA)
 
+    def detect_shape_type(self, image):
+        """
+        Detect if shape is primarily curved or straight-edged
+        Returns: 'curved' or 'straight'
+        """
+        _, thresh = cv2.threshold(image, 127, 255, cv2.THRESH_BINARY)
+        contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        
+        if not contours:
+            return 'unknown'
+        
+        cnt = max(contours, key=cv2.contourArea)
+        
+        # Calculate circularity
+        area = cv2.contourArea(cnt)
+        perimeter = cv2.arcLength(cnt, True)
+        if perimeter > 0:
+            circularity = 4 * np.pi * area / (perimeter * perimeter)
+        else:
+            circularity = 0
+        
+        # Calculate straightness by approximating polygon
+        epsilon = 0.02 * perimeter
+        approx = cv2.approxPolyDP(cnt, epsilon, True)
+        vertices = len(approx)
+        
+        # High circularity and few vertices indicate curved shape
+        if circularity > 0.7 and vertices < 8:
+            return 'curved'
+        else:
+            return 'straight'
+
+    def is_circular_shape(self, image):
+        """Quick check if shape is circular"""
+        _, thresh = cv2.threshold(image, 127, 255, cv2.THRESH_BINARY)
+        contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        
+        if not contours:
+            return False
+        
+        cnt = max(contours, key=cv2.contourArea)
+        area = cv2.contourArea(cnt)
+        perimeter = cv2.arcLength(cnt, True)
+        
+        if perimeter > 0:
+            circularity = 4 * np.pi * area / (perimeter * perimeter)
+            return circularity > 0.7  # Threshold for circular shapes
+        return False
+
+    def compare_shape_descriptors(self, img1, img2):
+        """
+        Compare shape descriptors to differentiate between curves and straight edges
+        """
+        # Convert to binary for contour analysis
+        _, thresh1 = cv2.threshold(img1, 127, 255, cv2.THRESH_BINARY)
+        _, thresh2 = cv2.threshold(img2, 127, 255, cv2.THRESH_BINARY)
+        
+        # Find contours
+        contours1, _ = cv2.findContours(thresh1, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        contours2, _ = cv2.findContours(thresh2, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        
+        if not contours1 or not contours2:
+            return 0.5  # Neutral score if no contours found
+        
+        # Get largest contour for each image
+        cnt1 = max(contours1, key=cv2.contourArea)
+        cnt2 = max(contours2, key=cv2.contourArea)
+        
+        # 1. Compare Hu Moments (rotation, scale, translation invariant)
+        hu_moments1 = cv2.HuMoments(cv2.moments(cnt1)).flatten()
+        hu_moments2 = cv2.HuMoments(cv2.moments(cnt2)).flatten()
+        
+        # Log scale Hu moments for comparison
+        hu1 = np.sign(hu_moments1) * np.log10(np.abs(hu_moments1) + 1e-10)
+        hu2 = np.sign(hu_moments2) * np.log10(np.abs(hu_moments2) + 1e-10)
+        hu_distance = np.linalg.norm(hu1 - hu2)
+        hu_similarity = 1.0 / (1.0 + hu_distance)
+        
+        # 2. Compare curvature/smoothness
+        # Approximate polygon to detect straight vs curved segments
+        epsilon1 = 0.01 * cv2.arcLength(cnt1, True)
+        epsilon2 = 0.01 * cv2.arcLength(cnt2, True)
+        approx1 = cv2.approxPolyDP(cnt1, epsilon1, True)
+        approx2 = cv2.approxPolyDP(cnt2, epsilon2, True)
+        
+        # Fewer vertices indicates smoother/more circular shape
+        vertices_ratio = min(len(approx1), len(approx2)) / max(len(approx1), len(approx2), 1)
+        
+        # 3. Compare aspect ratio (circles are near 1.0, long shapes are far from 1.0)
+        rect1 = cv2.minAreaRect(cnt1)
+        rect2 = cv2.minAreaRect(cnt2)
+        aspect1 = max(rect1[1]) / (min(rect1[1]) + 1e-10)
+        aspect2 = max(rect2[1]) / (min(rect2[1]) + 1e-10)
+        aspect_similarity = 1.0 - min(abs(aspect1 - aspect2) / 10.0, 1.0)
+        
+        # Combine shape features
+        shape_score = 0.5 * hu_similarity + 0.3 * vertices_ratio + 0.2 * aspect_similarity
+        
+        return shape_score
+
     def fast_similarity(self, img1, img2):
         hash1 = self.compute_image_hash(img1)
         hash2 = self.compute_image_hash(img2)
@@ -123,12 +228,25 @@ class OptimizedProfileMatcher:
             else:
                 similarity = ssim(img1, img2)
             
+            # ADD SHAPE DESCRIPTOR COMPARISON
+            shape_similarity = self.compare_shape_descriptors(img1, img2)
+            
             edges1 = cv2.Canny(img1, 50, 150)
             edges2 = cv2.Canny(img2, 50, 150)
             
             edge_match = np.sum(edges1 & edges2) / max(np.sum(edges1), np.sum(edges2)) if max(np.sum(edges1), np.sum(edges2)) > 0 else 0
             
-            final_score = 0.5 * similarity + 0.5 * edge_match
+            # Detect if shapes are fundamentally different types
+            is_img1_circular = self.is_circular_shape(img1)
+            is_img2_circular = self.is_circular_shape(img2)
+            
+            # Adjust weights based on shape compatibility
+            if is_img1_circular != is_img2_circular:
+                # If shapes are different types, give more weight to shape descriptors
+                final_score = 0.2 * similarity + 0.1 * edge_match + 0.7 * shape_similarity
+            else:
+                # If shapes are same type, use balanced weights
+                final_score = 0.3 * similarity + 0.3 * edge_match + 0.4 * shape_similarity
             
             return min(final_score, 1.0)
         except:
@@ -147,6 +265,9 @@ class OptimizedProfileMatcher:
         user_standardized = self.fast_normalize(user_gray, preserve_aspect=True)
         user_hash = self.compute_image_hash(user_standardized)
         
+        # Detect user image shape type
+        user_shape_type = self.detect_shape_type(user_standardized)
+        
         # Check for exact match first
         exact_matches = []
         if user_hash in self.template_hashes:
@@ -156,7 +277,8 @@ class OptimizedProfileMatcher:
                 'class': exact_match['class'],
                 'filename': exact_match['filename'],
                 'standardized': exact_match['standardized'],
-                'is_exact_match': True
+                'is_exact_match': True,
+                'shape_type': exact_match['shape_type']
             })
         
         if exact_matches:
@@ -167,14 +289,27 @@ class OptimizedProfileMatcher:
         
         for class_name, template_list in self.templates.items():
             for template in template_list:
+                # Apply shape type compatibility penalty
+                if user_shape_type != template['shape_type']:
+                    # Different shape types get penalty
+                    shape_penalty = 0.5
+                else:
+                    shape_penalty = 1.0
+                
                 similarity = self.fast_similarity(user_standardized, template['standardized'])
                 
+                # Apply shape penalty
+                adjusted_similarity = similarity * shape_penalty
+                
                 matches.append({
-                    'similarity': similarity,
+                    'similarity': adjusted_similarity,
+                    'raw_similarity': similarity,  # Keep original for reference
                     'class': class_name,
                     'image': template['original'],
                     'processed': template['standardized'],
-                    'filename': template['filename']
+                    'filename': template['filename'],
+                    'shape_type': template['shape_type'],
+                    'user_shape_type': user_shape_type
                 })
 
         matches.sort(key=lambda x: x['similarity'], reverse=True)
@@ -189,6 +324,17 @@ class OptimizedProfileMatcher:
                     break
         
         st.write(f"⏱️ Matching completed in {time.time()-start_time:.2f} seconds")
+        
+        # Log shape type information for debugging
+        shape_counts = {}
+        for result in results:
+            shape_type = result.get('shape_type', 'unknown')
+            shape_counts[shape_type] = shape_counts.get(shape_type, 0) + 1
+        
+        if shape_counts:
+            shape_info = ", ".join([f"{k}: {v}" for k, v in shape_counts.items()])
+            st.info(f"User shape: {user_shape_type}, Matches: {shape_info}")
+        
         return user_standardized, results
 
 def display_results_with_selection(user_img, processed_user, matches):
@@ -202,6 +348,16 @@ def display_results_with_selection(user_img, processed_user, matches):
         st.image(user_img, caption="Original Input", use_column_width=True)
     with col2:
         st.image(processed_user, caption="Normalized (Preserved Aspect Ratio)", use_column_width=True)
+    
+    # Show shape type information
+    if matches and 'user_shape_type' in matches[0]:
+        user_shape = matches[0]['user_shape_type']
+        if user_shape == 'curved':
+            st.info(f"📐 Detected shape type: **Circular/Curved** profile")
+        elif user_shape == 'straight':
+            st.info(f"📐 Detected shape type: **Straight-edged** profile")
+        else:
+            st.info(f"📐 Detected shape type: **{user_shape.capitalize()}**")
     
     # Show exact match notification
     if matches and matches[0].get('is_exact_match', False):
@@ -260,6 +416,13 @@ def display_results_with_selection(user_img, processed_user, matches):
             col.caption(f"Class: {match['class']}")
             col.caption(f"File: {match['filename']}")
             
+            # Show shape type indicator
+            shape_type = match.get('shape_type', 'unknown')
+            if shape_type == 'curved':
+                col.markdown("🔵 **Circular**")
+            elif shape_type == 'straight':
+                col.markdown("📏 **Straight-edged**")
+            
             if is_selected:
                 col.success("✅ Selected")
     
@@ -290,27 +453,48 @@ def display_results_with_selection(user_img, processed_user, matches):
             
             # Show similarity score
             similarity_value = selected_match['similarity']
+            raw_similarity = selected_match.get('raw_similarity', similarity_value)
+            
             if similarity_value == 1.0 and selected_match.get('is_exact_match', False):
                 st.success("🎯 Perfect Match (100% identical)")
             else:
-                st.metric("Similarity Score", f"{similarity_value:.3f}")
+                col1a, col1b = st.columns(2)
+                with col1a:
+                    st.metric("Adjusted Similarity", f"{similarity_value:.3f}")
+                with col1b:
+                    if raw_similarity != similarity_value:
+                        st.metric("Raw Similarity", f"{raw_similarity:.3f}")
+                        st.caption("(Before shape penalty)")
             
             st.caption(f"File: {selected_match['filename']}")
             st.caption(f"Rank: {st.session_state.selected_match_idx + 1} of {len(matches)}")
+            
+            # Show shape compatibility
+            user_shape = selected_match.get('user_shape_type', 'unknown')
+            match_shape = selected_match.get('shape_type', 'unknown')
+            if user_shape == match_shape:
+                st.success(f"✅ Shape compatible: Both {user_shape}")
+            else:
+                st.warning(f"⚠️ Different shapes: User={user_shape}, Match={match_shape}")
         
         with col2:
             # Show match details
             st.markdown("**📊 Match Details**")
             st.write(f"**Class:** {selected_match['class']}")
             st.write(f"**Similarity:** {selected_match['similarity']:.3f}")
+            if 'raw_similarity' in selected_match and selected_match['raw_similarity'] != selected_match['similarity']:
+                st.write(f"**Raw Similarity:** {selected_match['raw_similarity']:.3f}")
             st.write(f"**Filename:** {selected_match['filename']}")
+            
+            shape_type = selected_match.get('shape_type', 'unknown')
+            st.write(f"**Shape Type:** {shape_type.capitalize()}")
             
             if selected_match.get('is_exact_match', False):
                 st.success("**Type:** Exact Match")
             else:
                 st.info("**Type:** Similar Match")
         
-        # 4. Show all matches summary table
+        # Show all matches summary table
         st.subheader("📋 All Matches Summary")
         
         import pandas as pd
@@ -321,7 +505,8 @@ def display_results_with_selection(user_img, processed_user, matches):
             summary_data.append({
                 "Rank": i,
                 "Class": match['class'],
-                "Similarity": f"{match['similarity']:.3f}",
+                "Adjusted Similarity": f"{match['similarity']:.3f}",
+                "Shape Type": match.get('shape_type', 'unknown').capitalize(),
                 "Type": "Exact" if match.get('is_exact_match', False) else "Similar",
                 "Selected": "✅" if is_selected else ""
             })
@@ -448,7 +633,16 @@ def main():
         if hasattr(st.session_state, 'matcher'):
             if st.session_state.matcher.templates:
                 template_count = sum(len(v) for v in st.session_state.matcher.templates.values())
+                shape_types = {}
+                for class_name, templates in st.session_state.matcher.templates.items():
+                    for template in templates:
+                        shape_type = template.get('shape_type', 'unknown')
+                        shape_types[shape_type] = shape_types.get(shape_type, 0) + 1
+                
                 st.success(f"✅ {template_count} templates loaded")
+                if shape_types:
+                    shape_info = ", ".join([f"{k}: {v}" for k, v in shape_types.items()])
+                    st.info(f"Shape distribution: {shape_info}")
         
         st.markdown("---")
         st.markdown("**🎯 Instructions:**")
@@ -456,29 +650,35 @@ def main():
         st.markdown("2. Click 'Find Matches'")
         st.markdown("3. Click on any match image to select it")
         st.markdown("4. Selected match shown as Best Match")
+        st.markdown("5. **New:** Shape-aware matching - circular vs straight edges")
 
     with st.expander("ℹ️ How to use"):
         st.markdown("""
-        **🔍 Features:**
-        1. **Clickable Images**: Click on any match to select it
-        2. **Exact Match Detection**: Identical images show as 100% match
-        3. **Preserved Aspect Ratio**: Images shown in original proportions
-        4. **Fast Matching**: Optimized for speed
+        **🔍 Enhanced Features:**
+        1. **Shape-Aware Matching**: Automatically detects if profile is circular/curved or straight-edged
+        2. **Shape Compatibility**: Penalizes matches between different shape types
+        3. **Clickable Images**: Click on any match to select it
+        4. **Exact Match Detection**: Identical images show as 100% match
+        5. **Preserved Aspect Ratio**: Images shown in original proportions
+        6. **Hu Moments**: Uses rotation/scale/translation invariant shape descriptors
         
         **📊 Workflow:**
-        1. All matches shown first for selection
-        2. Click any image to select it as "Best Match"
-        3. Selected match shown with details
-        4. No measurements - focus on visual similarity
+        1. Upload profile image (circular or straight-edged)
+        2. System detects shape type automatically
+        3. Finds similar profiles with same shape type preference
+        4. All matches shown for selection
+        5. Click any image to select it as "Best Match"
+        
+        **🎯 Shape Detection:**
+        - **Circular/Curved**: Rounded profiles, pipes, tubes
+        - **Straight-edged**: Angular profiles, channels, beams
+        
+        **⚙️ Matching Algorithm:**
+        - **SSIM**: Structural similarity for texture
+        - **Edge Matching**: Canny edge detection
+        - **Hu Moments**: Shape descriptors for geometry
+        - **Shape Penalty**: Reduced scores for different shape types
         """)
 
 if __name__ == "__main__":
     main()
-
-
-
-
-
-
-
-
